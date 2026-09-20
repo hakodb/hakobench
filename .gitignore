@@ -1,0 +1,6 @@
+*.exe
+*.obj
+*.log
+*.dll
+bench_data_*
+sqlite_bench_data_*
