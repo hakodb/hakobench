@@ -8,7 +8,7 @@ run locally against a core build or a release tag asset.
 
 | hakobench | hakodb core |
 |---|---|
-| 0.1.1 | `cloud_sync` branch / `v0.8.20`+ release asset |
+| 0.1.1 | `cloud_sync` branch / `v0.8.21`+ release asset |
 
 ## Build (Windows, MinGW)
 
