@@ -1,4 +1,4 @@
-# hako-bench
+# hakobench
 
 Official C++ benchmark harnesses for
 HakoDB. No CI here by design —
@@ -6,7 +6,7 @@ run locally against a core build or a release tag asset.
 
 ## Compatibility
 
-| hako-bench | hakodb core |
+| hakobench | hakodb core |
 |---|---|
 | 0.1.1 | `cloud_sync` branch / `v0.8.20`+ release asset |
 
