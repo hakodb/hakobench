@@ -50,3 +50,52 @@ Linux: `g++ -O2 -std=c++17 -I$FIRELITE_DIR/include benchmark.cpp
 
 Methodology notes live in [docs/benchmarking.md](docs/benchmarking.md).
 The SQLite duel (`sqlite_bench.cpp`) needs a local sqlite3 dev library.
+
+## What it measures
+
+For each profile it reports throughput (operations per second) and system metrics:
+
+| Metric | Description |
+|---|---|
+| `WPS (Sgl/Btc)` | Single writes/sec and batch writes/sec |
+| `RPS (Seq/Par)` | Sequential and multi-threaded point-reads/sec |
+| `STRESS (Get/Qry/Cmp)` | Mixed point-get, indexed-query, and composite-query throughput |
+| `QPS (Off/Cur)` | Offset-pagination and cursor-pagination queries/sec |
+| `Agg QPS` | Aggregate queries/sec (`sum`) |
+| `Tx WPS` | Serializable transactions/sec |
+| `Bulk Upd/Del` | Bulk update and bulk delete ops/sec |
+| `Scan (Fwd/Rev)` | Full-table decoded scans both directions, docs/s |
+| `ScanRaw` (FireLite) / `ScanKey` (SQLite) | Byte/key-only full scans, docs/s |
+| `Startup/Flush` | Engine open (ms) and clean shutdown (ms) |
+| `Size` | On-disk database size |
+
+It runs six profiles across durability and workload mixes: `Always`, `Interval`, `Manual`, `OnCommit`, `Enc_Comp` (encrypted + compressed), and `Gaming` (large documents, parallel workers).
+
+## Run
+
+```sh
+# default dataset (1,000 docs per profile)
+./benchmark --docs=1000
+
+# larger dataset
+./benchmark --docs=10000
+
+# single-profile write-phase breakdown (encode / wal / index / flush timings)
+./benchmark --profile=Always --wstats
+
+# CI regression gate: Qry>=Cmp, Off/Cur within 2x, Get>5xQry, Batch>=Single + smoke floors
+./benchmark --gate
+
+# if the shared library is not on the default loader path (Linux/macOS)
+LD_LIBRARY_PATH=<firelite>/target/release ./benchmark --docs=1000
+```
+
+Timing guidance: the suites print one line per profile/mode and go quiet
+through all stages — that is normal. Full `--docs=10000` runs take
+several minutes (durable profiles fsync per write; Gaming moves 500MB).
+For quick scan numbers use `./benchmark --profile=Manual --docs=10000`
+or `sqlite_bench --docs=10000 --sync=OFF --journal=MEMORY`.
+
+> `--docs` controls how many documents each profile inserts (batch-written documents are `--docs - 100`). Use `--docs >= 1000` for meaningful numbers; very small values (e.g. `100`) leave too little data for the batch/query stages.
+
+Each run creates and destroys temporary `bench_data_*` directories — no existing database is touched.

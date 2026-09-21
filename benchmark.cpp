@@ -1,4 +1,4 @@
-#include "include/firelite.h"
+#include "include/hako.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -24,27 +24,27 @@ using namespace std;
 // RAII HELPERS
 // ============================================================
 
-struct FLDeleter {
-    void operator()(FL_Doc* p) const { if (p) fl_doc_free(p); }
-    void operator()(FL_Batch* p) const { if (p) fl_batch_free(p); }
-    void operator()(FL_Query* p) const { if (p) fl_query_free(p); }
-    void operator()(FL_Transaction* p) const { if (p) fl_transaction_free(p); }
-    void operator()(FL_Watch* p) const { if (p) fl_watch_free(p); }
-    void operator()(FL_Config* p) const { if (p) fl_config_free(p); }
-    void operator()(FL_Array* p) const { if (p) fl_array_free(p); }
-    void operator()(char* p) const { if (p) fl_string_free(p); }
-    void operator()(FL_ResultSet* p) const { if (p) fl_result_set_free(p); }
+struct HKDeleter {
+    void operator()(HK_Doc* p) const { if (p) hk_doc_free(p); }
+    void operator()(HK_Batch* p) const { if (p) hk_batch_free(p); }
+    void operator()(HK_Query* p) const { if (p) hk_query_free(p); }
+    void operator()(HK_Transaction* p) const { if (p) hk_transaction_free(p); }
+    void operator()(HK_Watch* p) const { if (p) hk_watch_free(p); }
+    void operator()(HK_Config* p) const { if (p) hk_config_free(p); }
+    void operator()(HK_Array* p) const { if (p) hk_array_free(p); }
+    void operator()(char* p) const { if (p) hk_string_free(p); }
+    void operator()(HK_ResultSet* p) const { if (p) hk_result_set_free(p); }
 };
 
-using UniqueDoc = unique_ptr<FL_Doc, FLDeleter>;
-using UniqueBatch = unique_ptr<FL_Batch, FLDeleter>;
-using UniqueQuery = unique_ptr<FL_Query, FLDeleter>;
-using UniqueString = unique_ptr<char, FLDeleter>;
-using UniqueConfig = unique_ptr<FL_Config, FLDeleter>;
-using UniqueWatch = unique_ptr<FL_Watch, FLDeleter>;
-using UniqueTx = unique_ptr<FL_Transaction, FLDeleter>;
-using UniqueArray = unique_ptr<FL_Array, FLDeleter>;
-using UniqueResultSet = unique_ptr<FL_ResultSet, FLDeleter>;
+using UniqueDoc = unique_ptr<HK_Doc, HKDeleter>;
+using UniqueBatch = unique_ptr<HK_Batch, HKDeleter>;
+using UniqueQuery = unique_ptr<HK_Query, HKDeleter>;
+using UniqueString = unique_ptr<char, HKDeleter>;
+using UniqueConfig = unique_ptr<HK_Config, HKDeleter>;
+using UniqueWatch = unique_ptr<HK_Watch, HKDeleter>;
+using UniqueTx = unique_ptr<HK_Transaction, HKDeleter>;
+using UniqueArray = unique_ptr<HK_Array, HKDeleter>;
+using UniqueResultSet = unique_ptr<HK_ResultSet, HKDeleter>;
 
 // ============================================================
 // DATA STRUCTURES
@@ -109,10 +109,10 @@ struct Report {
 std::atomic<size_t> g_snapshot_received{0};
 static bool g_wstats_enabled = false;
 
-// Print + reset the engine's write-phase counters (fl_debug_write_stats).
+// Print + reset the engine's write-phase counters (hk_debug_write_stats).
 static void dump_wstats(const char* tag) {
     if (!g_wstats_enabled) return;
-    UniqueString s(fl_debug_write_stats());
+    UniqueString s(hk_debug_write_stats());
     if (s) printf("\n[WSTATS %s]\n%s", tag, s.get());
 }
 
@@ -164,7 +164,7 @@ extern "C" void bench_on_snapshot(const char* col, const char* path, int kind, v
     g_snapshot_received.fetch_add(1, std::memory_order_relaxed);
 }
 
-// Full-scan counter for fl_cursor_walk: counts rows + bytes, keeps nothing.
+// Full-scan counter for hk_cursor_walk: counts rows + bytes, keeps nothing.
 struct WalkCount { long rows = 0; size_t bytes = 0; };
 static bool scan_count_cb(const char* id, uintptr_t id_len, const uint8_t* bytes, uintptr_t bytes_len, void* userdata) {
     auto* c = static_cast<WalkCount*>(userdata);
@@ -174,16 +174,16 @@ static bool scan_count_cb(const char* id, uintptr_t id_len, const uint8_t* bytes
     return true;
 }
 
-// Lazy-scan counter for fl_cursor_walk_view: pulls tenant (str) + age
+// Lazy-scan counter for hk_cursor_walk_view: pulls tenant (str) + age
 // (int) per row (mirrors sqlite's narrow id/tenant/age select), counts rows.
 struct ViewWalkCount { long rows = 0; volatile size_t sink = 0; };
-static bool scan_view_cb(const char* id, uintptr_t id_len, const FL_ViewDoc* view, void* userdata) {
+static bool scan_view_cb(const char* id, uintptr_t id_len, const HK_ViewDoc* view, void* userdata) {
     auto* c = static_cast<ViewWalkCount*>(userdata);
     uintptr_t tlen = 0;
-    const char* t = fl_view_get_str(view, "tenant", &tlen);
+    const char* t = hk_view_get_str(view, "tenant", &tlen);
     int64_t age = 0;
     size_t touch = tlen + (t && tlen > 0 ? (size_t)(unsigned char)t[0] : 0);
-    if (fl_view_get_int(view, "age", &age)) touch += (size_t)age;
+    if (hk_view_get_int(view, "age", &age)) touch += (size_t)age;
     c->rows++;
     c->sink += touch;
     (void)id; (void)id_len;
@@ -226,35 +226,35 @@ static uintmax_t get_dir_size(const string& path) {
 }
 
 UniqueDoc make_complex_doc(int i, const string& payload) {
-    UniqueDoc d(fl_doc_new());
+    UniqueDoc d(hk_doc_new());
     char buf[64];
     snprintf(buf, sizeof(buf), "tenant-%d", i % 32);
-    fl_doc_insert_str(d.get(), "tenant", buf);
-    fl_doc_insert_int(d.get(), "age", 18 + (i % 70));
-    fl_doc_insert_bool(d.get(), "active", i % 3 != 0);
-    fl_doc_insert_float(d.get(), "score", ((i % 10000) / 7.0) + 0.5);
+    hk_doc_insert_str(d.get(), "tenant", buf);
+    hk_doc_insert_int(d.get(), "age", 18 + (i % 70));
+    hk_doc_insert_bool(d.get(), "active", i % 3 != 0);
+    hk_doc_insert_float(d.get(), "score", ((i % 10000) / 7.0) + 0.5);
     snprintf(buf, sizeof(buf), "firelite v0.6.4 benchmark payload %d", i);
-    fl_doc_insert_str(d.get(), "description", buf);
-    FL_Array* tags = fl_array_new();
+    hk_doc_insert_str(d.get(), "description", buf);
+    HK_Array* tags = hk_array_new();
     snprintf(buf, sizeof(buf), "tag-%d", i % 10);
-    fl_array_append_str(tags, buf);
-    fl_array_append_str(tags, "bench");
-    fl_doc_insert_array(d.get(), "tags", tags); 
-    if (!payload.empty()) fl_doc_insert_str(d.get(), "extra", payload.c_str());
+    hk_array_append_str(tags, buf);
+    hk_array_append_str(tags, "bench");
+    hk_doc_insert_array(d.get(), "tags", tags); 
+    if (!payload.empty()) hk_doc_insert_str(d.get(), "extra", payload.c_str());
     return d;
 }
 
-FL_Config* create_config_ptr(const BenchConfig& cfg) {
-    FL_Config* fcfg = fl_config_new();
-    fl_config_set_durability(fcfg, cfg.durability);
-    fl_config_set_query_workers(fcfg, cfg.threads);
-    fl_config_set_compression(fcfg, cfg.zip, 3);
-    fl_config_set_audit_log(fcfg, false, "");
-    fl_config_set_storage_tuning(fcfg, 4096, 8 * 1024 * 1024, 256);
-    fl_config_set_memory_limits(fcfg, 256 * 1024 * 1024, cfg.inline_mb * 1024 * 1024);
-    if (cfg.wal_reserve_bytes > 0) fl_config_set_wal_reserve_bytes(fcfg, cfg.wal_reserve_bytes);
-    if (cfg.no_maintenance) fl_config_set_background_maintenance(fcfg, false);
-    if (cfg.enc) fl_config_set_encryption_key(fcfg, "master-key-2026");
+HK_Config* create_config_ptr(const BenchConfig& cfg) {
+    HK_Config* fcfg = hk_config_new();
+    hk_config_set_durability(fcfg, cfg.durability);
+    hk_config_set_query_workers(fcfg, cfg.threads);
+    hk_config_set_compression(fcfg, cfg.zip, 3);
+    hk_config_set_audit_log(fcfg, false, "");
+    hk_config_set_storage_tuning(fcfg, 4096, 8 * 1024 * 1024, 256);
+    hk_config_set_memory_limits(fcfg, 256 * 1024 * 1024, cfg.inline_mb * 1024 * 1024);
+    if (cfg.wal_reserve_bytes > 0) hk_config_set_wal_reserve_bytes(fcfg, cfg.wal_reserve_bytes);
+    if (cfg.no_maintenance) hk_config_set_background_maintenance(fcfg, false);
+    if (cfg.enc) hk_config_set_encryption_key(fcfg, "master-key-2026");
     return fcfg;
 }
 
@@ -274,22 +274,22 @@ Report run_benchmark(BenchConfig cfg) {
 
     // stage("Engine Open");
     auto t_bench = now();
-    FL_Engine* db = fl_engine_open_with_config(path.c_str(), create_config_ptr(cfg));
+    HK_Engine* db = hk_engine_open_with_config(path.c_str(), create_config_ptr(cfg));
     if (!db) { res.success = false; return res; }
     res.startup_ms = diff_ms(t_bench);
     // cout << res.startup_ms << "ms";
 
     // stage("Snapshot Setup (Watch)");
     g_snapshot_received.store(0, std::memory_order_relaxed);
-    UniqueWatch watcher(fl_engine_watch(db, "bench", bench_on_snapshot, nullptr));
+    UniqueWatch watcher(hk_engine_watch(db, "bench", bench_on_snapshot, nullptr));
     // cout << "ACTIVE";
 
     // stage("Indexing..");
-    fl_engine_create_simple_index(db, "bench", "active"); 
-    fl_engine_create_simple_index(db, "bench", "tenant"); 
-    fl_engine_create_simple_index(db, "bench", "id"); 
-    fl_engine_create_index(db, "bench", "[{\"field\": \"id\", \"desc\": false}]");
-    fl_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"score\", \"desc\": true}]");
+    hk_engine_create_simple_index(db, "bench", "active"); 
+    hk_engine_create_simple_index(db, "bench", "tenant"); 
+    hk_engine_create_simple_index(db, "bench", "id"); 
+    hk_engine_create_index(db, "bench", "[{\"field\": \"id\", \"desc\": false}]");
+    hk_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"score\", \"desc\": true}]");
     // cout << "Ready";
 
     // 1. WRITE TEST
@@ -301,7 +301,7 @@ Report run_benchmark(BenchConfig cfg) {
         char key_buf[16];
         snprintf(key_buf, sizeof(key_buf), "s_%d", i);
         // Move semantics: the freshly built doc is consumed, no deep clone.
-        fl_engine_insert_take(db, "bench", key_buf, d.release());
+        hk_engine_insert_take(db, "bench", key_buf, d.release());
     }
     res.single_wps = to_throughput(s_write_count, diff_ms(t_start));
     // cout << fixed << setprecision(0) << res.single_wps << " wps";
@@ -311,15 +311,15 @@ Report run_benchmark(BenchConfig cfg) {
     t_start = now();
     int b_total = cfg.total_docs - 100;
     for (int i = 0; i < b_total; i += cfg.batch_size) {
-        UniqueBatch b(fl_batch_new());
+        UniqueBatch b(hk_batch_new());
         int chunk = min(cfg.batch_size, b_total - i);
         for (int j = 0; j < chunk; j++) {
             auto d = make_complex_doc(i + j + 100, payload);
             char key_buf[16];
             snprintf(key_buf, sizeof(key_buf), "b_%d", i + j);
-            fl_batch_set(b.get(), "bench", key_buf, d.get());
+            hk_batch_set(b.get(), "bench", key_buf, d.get());
         }
-        fl_batch_commit(db, b.get());
+        hk_batch_commit(db, b.get());
     }
     res.batch_wps = to_throughput(b_total, diff_ms(t_start));
     // cout << res.batch_wps << " wps";
@@ -331,7 +331,7 @@ Report run_benchmark(BenchConfig cfg) {
     // recovery actually takes (bounded, then proceed degraded like prod).
     {
         auto t_ready = now();
-        while (!fl_engine_is_indexes_ready(db)) {
+        while (!hk_engine_is_indexes_ready(db)) {
             if (diff_ms(t_ready) > 30000) break;
             this_thread::sleep_for(chrono::milliseconds(20));
         }
@@ -343,7 +343,7 @@ Report run_benchmark(BenchConfig cfg) {
     t_start = now();
     int seq_read_count = 200;
     for (int i = 0; i < seq_read_count; i++) {
-        UniqueDoc d(fl_engine_get(db, "bench", "b_100"));
+        UniqueDoc d(hk_engine_get(db, "bench", "b_100"));
     }
     res.s_read_rps = to_throughput(seq_read_count, diff_ms(t_start));
     // cout << res.s_read_rps << " rps";
@@ -355,7 +355,7 @@ Report run_benchmark(BenchConfig cfg) {
     for(int t=0; t<cfg.threads; t++) {
         pool.emplace_back([db, par_read_per_thread]() {
             for(int i=0; i<par_read_per_thread; i++) {
-                UniqueDoc d(fl_engine_get(db, "bench", "b_100"));
+                UniqueDoc d(hk_engine_get(db, "bench", "b_100"));
             }
         });
     }
@@ -367,15 +367,15 @@ Report run_benchmark(BenchConfig cfg) {
     // stage("Bulk Update WPS");
     t_start = now();
     int upd_count = 100;
-    UniqueBatch batch_upd(fl_batch_new());
-    UniqueDoc upd(fl_doc_new());
-    fl_doc_insert_str(upd.get(), "status", "updated");
+    UniqueBatch batch_upd(hk_batch_new());
+    UniqueDoc upd(hk_doc_new());
+    hk_doc_insert_str(upd.get(), "status", "updated");
     for(int i=0; i<upd_count; i++) {
         char key_buf[16];
         snprintf(key_buf, sizeof(key_buf), "b_%d", i);
-        fl_batch_set(batch_upd.get(), "bench", key_buf, upd.get());
+        hk_batch_set(batch_upd.get(), "bench", key_buf, upd.get());
     }
-    fl_batch_commit(db, batch_upd.get());
+    hk_batch_commit(db, batch_upd.get());
     res.bulk_upd_wps = to_throughput(upd_count, diff_ms(t_start));
     // cout << res.bulk_upd_wps << " wps";
 
@@ -383,12 +383,12 @@ Report run_benchmark(BenchConfig cfg) {
     t_start = now();
     int tx_count = 50;
     for (int i = 0; i < tx_count; i++) {
-        UniqueTx tx(fl_transaction_begin(db));
-        UniqueDoc cur(fl_transaction_get(db, tx.get(), "bench", "b_200"));
+        UniqueTx tx(hk_transaction_begin(db));
+        UniqueDoc cur(hk_transaction_get(db, tx.get(), "bench", "b_200"));
         if (cur) {
-            fl_doc_insert_int(cur.get(), "tx_ver", i);
-            fl_transaction_set(tx.get(), "bench", "b_200", cur.get());
-            fl_transaction_commit(db, tx.release());
+            hk_doc_insert_int(cur.get(), "tx_ver", i);
+            hk_transaction_set(tx.get(), "bench", "b_200", cur.get());
+            hk_transaction_commit(db, tx.release());
         }
     }
     res.tx_wps = to_throughput(tx_count, diff_ms(t_start));
@@ -397,24 +397,24 @@ Report run_benchmark(BenchConfig cfg) {
     // 4. RANGE QUERY (QPS)
     // stage("Range Query QPS");
     int mid = b_total / 2;
-    UniqueQuery q_off(fl_query_new("bench"));
-    fl_query_order_by(q_off.get(), "id", true); 
-    fl_query_offset(q_off.get(), mid); 
-    fl_query_limit(q_off.get(), 20);
+    UniqueQuery q_off(hk_query_new("bench"));
+    hk_query_order_by(q_off.get(), "id", true); 
+    hk_query_offset(q_off.get(), mid); 
+    hk_query_limit(q_off.get(), 20);
     
     t_start = now(); 
-    for(int i=0; i<300; i++) UniqueResultSet qo(fl_query_execute_to_handles(db, q_off.get())); 
+    for(int i=0; i<300; i++) UniqueResultSet qo(hk_query_execute_to_handles(db, q_off.get())); 
     res.offset_qps = to_throughput(300, diff_ms(t_start));
 
     char mid_buf[16]; snprintf(mid_buf, sizeof(mid_buf), "b_%d", mid);
-    UniqueDoc start_doc(fl_engine_get(db, "bench", mid_buf));
-    UniqueQuery q_cur(fl_query_new("bench"));
-    fl_query_order_by(q_cur.get(), "id", true);
-    fl_query_start_at(q_cur.get(), start_doc.get());
-    fl_query_limit(q_cur.get(), 20);
+    UniqueDoc start_doc(hk_engine_get(db, "bench", mid_buf));
+    UniqueQuery q_cur(hk_query_new("bench"));
+    hk_query_order_by(q_cur.get(), "id", true);
+    hk_query_start_at(q_cur.get(), start_doc.get());
+    hk_query_limit(q_cur.get(), 20);
     
     t_start = now(); 
-    for(int i=0; i<300; i++) UniqueResultSet qc(fl_query_execute_to_handles(db, q_cur.get())); 
+    for(int i=0; i<300; i++) UniqueResultSet qc(hk_query_execute_to_handles(db, q_cur.get())); 
     res.cursor_qps = to_throughput(300, diff_ms(t_start));
     // cout << (int)res.cursor_qps << " qps";
 
@@ -426,7 +426,7 @@ Report run_benchmark(BenchConfig cfg) {
         for(int j=0; j<50; j++) {
             char key_buf[16];
             snprintf(key_buf, sizeof(key_buf), "b_%d", (i + j) % b_total);
-            UniqueDoc d(fl_engine_get(db, "bench", key_buf));
+            UniqueDoc d(hk_engine_get(db, "bench", key_buf));
         }
     }
     res.stress_get_rps = to_throughput(stress_loops * 50, diff_ms(t_start));
@@ -440,10 +440,10 @@ Report run_benchmark(BenchConfig cfg) {
     // termination at 20, no sort).
     t_start = now();
     for(int i=0; i<stress_loops; i++) {
-        UniqueQuery q(fl_query_new("bench"));
-        fl_query_where_eq_str(q.get(), "tenant", "tenant-2");
-        fl_query_limit(q.get(), 20);
-        UniqueResultSet rs(fl_query_execute_to_handles(db, q.get()));
+        UniqueQuery q(hk_query_new("bench"));
+        hk_query_where_eq_str(q.get(), "tenant", "tenant-2");
+        hk_query_limit(q.get(), 20);
+        UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
     }
     res.stress_query_qps = to_throughput(stress_loops, diff_ms(t_start));
     // cout << (int)res.stress_query_qps << " qps";
@@ -451,21 +451,21 @@ Report run_benchmark(BenchConfig cfg) {
     // stage("Composite Query QPS");
     t_start = now();
     for(int i=0; i<stress_loops; i++) {
-        UniqueQuery q(fl_query_new("bench"));
-        fl_query_where_eq_str(q.get(), "tenant", "tenant-2");
-        fl_query_order_by(q.get(), "score", false); 
-        fl_query_limit(q.get(), 20);
-        UniqueResultSet rs(fl_query_execute_to_handles(db, q.get()));
+        UniqueQuery q(hk_query_new("bench"));
+        hk_query_where_eq_str(q.get(), "tenant", "tenant-2");
+        hk_query_order_by(q.get(), "score", false); 
+        hk_query_limit(q.get(), 20);
+        UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
     }
     res.comp_query_qps = to_throughput(stress_loops, diff_ms(t_start));
     // cout << (int)res.comp_query_qps << " qps";
 
     // 6. AGGREGATION
     // stage("Aggregation QPS");
-    UniqueQuery aq(fl_query_new("bench"));
-    fl_query_aggregate_sum(aq.get(), "id");
+    UniqueQuery aq(hk_query_new("bench"));
+    hk_query_aggregate_sum(aq.get(), "id");
     t_start = now(); 
-    for(int i=0; i<50; i++) UniqueString agg_result(fl_query_execute_aggregation(db, aq.get())); 
+    for(int i=0; i<50; i++) UniqueString agg_result(hk_query_execute_aggregation(db, aq.get())); 
     res.agg_qps = to_throughput(50, diff_ms(t_start));
     // cout << (int)res.agg_qps << " qps";
 
@@ -476,23 +476,23 @@ Report run_benchmark(BenchConfig cfg) {
     // ponytail: settle background work first (index recovery, blob
     // persistence, maintenance) — a scan measured mid-flight benchmarks
     // contention, not the engine. Proceeds regardless after 30s.
-    fl_engine_await_quiescent(db, 30000);
+    hk_engine_await_quiescent(db, 30000);
     {
         const int SCAN_ITERS = 5;
         const int PAGE = 1000;
         long total_rows = 0;
         auto t = now();
         for (int it = 0; it < SCAN_ITERS; it++) {
-            UniqueQuery q(fl_query_new("bench"));
-            fl_query_order_by(q.get(), "id", true);
-            fl_query_limit(q.get(), PAGE);
+            UniqueQuery q(hk_query_new("bench"));
+            hk_query_order_by(q.get(), "id", true);
+            hk_query_limit(q.get(), PAGE);
             for (;;) {
-                UniqueResultSet rs(fl_query_execute_to_handles(db, q.get()));
-                size_t n = fl_result_set_count(rs.get());
+                UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
+                size_t n = hk_result_set_count(rs.get());
                 if (n == 0) break;
                 total_rows += (long)n;
-                FL_Doc* last = fl_result_set_get_doc(rs.get(), n - 1);
-                fl_query_start_after(q.get(), last);
+                HK_Doc* last = hk_result_set_get_doc(rs.get(), n - 1);
+                hk_query_start_after(q.get(), last);
             }
         }
         res.scan_fwd_dps = to_throughput((int)total_rows, diff_ms(t));
@@ -501,16 +501,16 @@ Report run_benchmark(BenchConfig cfg) {
         total_rows = 0;
         t = now();
         for (int it = 0; it < SCAN_ITERS; it++) {
-            UniqueQuery q(fl_query_new("bench"));
-            fl_query_order_by(q.get(), "id", false);
-            fl_query_limit(q.get(), PAGE);
+            UniqueQuery q(hk_query_new("bench"));
+            hk_query_order_by(q.get(), "id", false);
+            hk_query_limit(q.get(), PAGE);
             for (;;) {
-                UniqueResultSet rs(fl_query_execute_to_handles(db, q.get()));
-                size_t n = fl_result_set_count(rs.get());
+                UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
+                size_t n = hk_result_set_count(rs.get());
                 if (n == 0) break;
                 total_rows += (long)n;
-                FL_Doc* last = fl_result_set_get_doc(rs.get(), n - 1);
-                fl_query_start_after(q.get(), last);
+                HK_Doc* last = hk_result_set_get_doc(rs.get(), n - 1);
+                hk_query_start_after(q.get(), last);
             }
         }
         res.scan_rev_dps = to_throughput((int)total_rows, diff_ms(t));
@@ -519,10 +519,10 @@ Report run_benchmark(BenchConfig cfg) {
         size_t total_bytes = 0;
         t = now();
         for (int it = 0; it < SCAN_ITERS; it++) {
-            UniqueQuery q(fl_query_new("bench"));
-            fl_query_order_by(q.get(), "id", true);
+            UniqueQuery q(hk_query_new("bench"));
+            hk_query_order_by(q.get(), "id", true);
             WalkCount c;
-            int64_t n = fl_cursor_walk(db, q.get(), scan_count_cb, &c);
+            int64_t n = hk_cursor_walk(db, q.get(), scan_count_cb, &c);
             total_rows += (long)n;
             total_bytes += c.bytes;
         }
@@ -533,10 +533,10 @@ Report run_benchmark(BenchConfig cfg) {
         total_rows = 0;
         t = now();
         for (int it = 0; it < SCAN_ITERS; it++) {
-            UniqueQuery q(fl_query_new("bench"));
-            fl_query_order_by(q.get(), "id", true);
+            UniqueQuery q(hk_query_new("bench"));
+            hk_query_order_by(q.get(), "id", true);
             ViewWalkCount c;
-            int64_t n = fl_cursor_walk_view(db, q.get(), scan_view_cb, &c);
+            int64_t n = hk_cursor_walk_view(db, q.get(), scan_view_cb, &c);
             total_rows += (long)n;
         }
         res.scan_view_dps = to_throughput((int)total_rows, diff_ms(t));
@@ -546,20 +546,20 @@ Report run_benchmark(BenchConfig cfg) {
     // stage("Bulk Delete WPS");
     t_start = now();
     int del_count = 100;
-    UniqueBatch batch_del(fl_batch_new());
+    UniqueBatch batch_del(hk_batch_new());
     for(int i=0; i<del_count; i++) {
         char key_buf[16];
         snprintf(key_buf, sizeof(key_buf), "b_%d", i + 500);
-        fl_batch_delete(batch_del.get(), "bench", key_buf);
+        hk_batch_delete(batch_del.get(), "bench", key_buf);
     }
-    fl_batch_commit(db, batch_del.get());
+    hk_batch_commit(db, batch_del.get());
     res.bulk_del_wps = to_throughput(del_count, diff_ms(t_start));
     // cout << (int)res.bulk_del_wps << " wps";
 
     // 8. SHUTDOWN
     // stage("Shutdown (Flush)");
     t_start = now();
-    fl_engine_free(db);
+    hk_engine_free(db);
     res.shutdown_ms = diff_ms(t_start);
     // cout << res.shutdown_ms << "ms";
 
