@@ -15,7 +15,7 @@ run locally against a core build or a release tag asset.
 ```sh
 # HAKODB_DIR points at a core checkout (default: ../hakodb).
 # Note: -I takes the core root, because the source includes
-# "include/hako.h" by relative path.
+# "include/hakodb.h" by relative path.
 $env:HAKODB_DIR = "C:\Dev\libs\firelite"
 C:\Dev\msys64\ucrt64\bin\g++.exe -O2 -std=c++17 -I$env:HAKODB_DIR benchmark.cpp -L$env:HAKODB_DIR\target\release -lhakodb -o benchmark.exe
 ```
