@@ -1,9 +1,9 @@
 // sqlite_bench.cpp — SQLite mirror of bench/benchmark.cpp (fair-test shape).
 //
-// DEFAULT (no flags): runs a 4-mode durability matrix, mirroring FireLite's
+// DEFAULT (no flags): runs a 4-mode durability matrix, mirroring HakoDB's
 // multi-profile run. One row per mode, same stages/loop counts/math:
 //
-//   Mode      journal  sync    ~ FireLite profile
+//   Mode      journal  sync    ~ HakoDB profile
 //   Manual    MEMORY   OFF     Manual   (RAM-speed, no fsync)
 //   Interval  WAL      NORMAL  Interval (fast, periodic durability)
 //   OnCommit  DELETE   NORMAL  OnCommit (commit-batched durability)
@@ -20,7 +20,7 @@
 //   Seq reads 200x (b_100) | Par reads threads*50 | Bulk Update 100 (1 tx) |
 //   Tx x50 (read b_200 + update + commit) | Off/Cur pagination 300x |
 //   Stress GET 300x50 | Qry tenant-2 lim 20 300x | Cmp +ORDER score 300x |
-//   Agg SUM x50 (full-scan, like FireLite's sum stage) |
+//   Agg SUM x50 (full-scan, like HakoDB's sum stage) |
 //   SCAN TRIO x5 iters (mirrors benchmark.cpp 1:1): full SELECT * fwd/rev
 //   with OWNED per-row copies (true full-document materialization, the
 //   fair analog of owned full-doc decode), id-only key scan
@@ -30,10 +30,10 @@
 //
 // QryLazy (SELECT id only, same filter) is an EXTRA diagnostic per mode,
 // not part of the fair comparison: it shows SQLite's column-materialization
-// cost, i.e. the prize a lazy-decode path earns on the FireLite side.
+// cost, i.e. the prize a lazy-decode path earns on the HakoDB side.
 //
-// All SELECTs read EVERY column (mirrors FireLite's full-doc decode).
-// Prepared once, reset per iteration (mirrors FireLite's plan cache).
+// All SELECTs read EVERY column (mirrors HakoDB's full-doc decode).
+// Prepared once, reset per iteration (mirrors HakoDB's plan cache).
 //
 // Build (MSYS2/MinGW): g++ -O2 -std=c++17 -o sqlite_bench.exe sqlite_bench.cpp -lsqlite3
 // Build (Linux):       g++ -O2 -std=c++17 -pthread -o sqlite_bench sqlite_bench.cpp -lsqlite3
@@ -96,9 +96,9 @@ static void read_all_cols(sqlite3_stmt* st) {
 }
 
 // Owned full-row materialization: every TEXT column copied into a fresh
-// std::string per row (ints/doubles are values on both sides — FireLite's
+// std::string per row (ints/doubles are values on both sides — HakoDB's
 // Int/Float decode allocates nothing either). Used ONLY by the full-scan
-// stages, where the fair analog is FireLite's owned full-doc decode.
+// stages, where the fair analog is HakoDB's owned full-doc decode.
 // read_all_cols above only pokes accessor lengths (borrowed buffers).
 static void copy_all_cols(sqlite3_stmt* st) {
     volatile size_t sink = 0;
@@ -332,7 +332,7 @@ static Report run_once(const std::string& mode, const std::string& journal,
     r.qlazy_qps = qps(300, diff_ms(t));
     sqlite3_finalize(qlz_st);
 
-    // 11. Agg x50 — full-scan aggregation like FireLite's sum stage
+    // 11. Agg x50 — full-scan aggregation like HakoDB's sum stage
     sqlite3_stmt* agg_st = nullptr;
     sqlite3_prepare_v2(db, "SELECT SUM(age) FROM bench", -1, &agg_st, nullptr);
     t = now();
@@ -345,7 +345,7 @@ static Report run_once(const std::string& mode, const std::string& journal,
 
     // 11b. FULL-SCAN TRIO — mirrors benchmark.cpp scan block 1:1 (5 iters).
     // Fwd/rev: SELECT * over the whole table with OWNED per-row copies
-    // (the fair analog of FireLite's owned full-doc decode — accessor
+    // (the fair analog of HakoDB's owned full-doc decode — accessor
     // pokes alone would measure borrowed buffers, not documents).
     // Key: id column only (cursor + key movement ~ byte walk).
     {
