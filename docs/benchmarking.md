@@ -1,4 +1,4 @@
-# Benchmarking FireLite: measuring the engine, not the noise
+# Benchmarking HakoDB: measuring the engine, not the noise
 
 Two rules cover most benchmark sins with this engine: **settle before
 measuring**, and **compare equal work**. Everything below is commentary
@@ -21,19 +21,19 @@ let s = db.quiescence_status(); // indexes_ready, pending_index_ops,
 // maintenance_running — plus is_quiescent()
 ```
 
-FFI: `fl_engine_await_quiescent(db, 30000)`, `fl_engine_quiescence_status(db)`
-(JSON, free with `fl_string_free`). `is_indexes_ready` alone covers only
+FFI: `hk_engine_await_quiescent(db, 30000)`, `hk_engine_quiescence_status(db)`
+(JSON, free with `hk_string_free`). `is_indexes_ready` alone covers only
 stage one of four — enough for *correct* plans, not for *stable* numbers.
 
 ## Compare equal work
 
-| Shape | FireLite op | Fair rival op | Notes |
+| Shape | HakoDB op | Fair rival op | Notes |
 |---|---|---|---|
 | Owned full scan | decoded keyset pages | `SELECT *` + owned per-row copies | Accessor pokes alone measure borrowed buffers — copy to compare documents |
-| Byte scan | `walk` / `fl_cursor_walk` | cursor + key movement | No decode either side |
+| Byte scan | `walk` / `hk_cursor_walk` | cursor + key movement | No decode either side |
 | Lazy (few fields) | `walk_view` + pulls | narrow `SELECT` + accessor touches | Same fields, same count |
 | Point field | `viewGet` + typed getter | raw value fetch | No JSON on either side |
-| JSON serve | `fl_result_set_to_json` | `json_group_array(json_object(…))` | Never hand-rolled harness C; verify binary handling matches |
+| JSON serve | `hk_result_set_to_json` | `json_group_array(json_object(…))` | Never hand-rolled harness C; verify binary handling matches |
 | Deep pages | keyset `start_after` at depth D | `OFFSET D LIMIT 20` | The O(log N) vs O(N) duel |
 
 Anti-patterns that have actually bitten: paging raw result sets and
@@ -54,7 +54,7 @@ measures conversion, not reads); warmed-vs-cold run-order effects
 
 ## Reference scoreboard (10k complex docs, same box)
 
-| Scan | FireLite | SQLite |
+| Scan | HakoDB | SQLite |
 |---|---|---|
 | Decoded fwd/rev | ~130–220k docs/s | ~430k docs/s (owned) |
 | Lazy (2–3 fields) | ~890k | ~1.1M |

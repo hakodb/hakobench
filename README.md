@@ -1,45 +1,45 @@
-# firelite-bench
+# hako-bench
 
 Official C++ benchmark harnesses for
-[FireLite](https://github.com/rizaptk/firelite). No CI here by design —
+HakoDB. No CI here by design —
 run locally against a core build or a release tag asset.
 
 ## Compatibility
 
-| firelite-bench | firelite core |
+| hako-bench | hakodb core |
 |---|---|
 | 0.1.1 | `cloud_sync` branch / `v0.8.20`+ release asset |
 
 ## Build (Windows, MinGW)
 
 ```sh
-# FIRELITE_DIR points at a core checkout (default: ../firelite).
+# HAKODB_DIR points at a core checkout (default: ../hakodb).
 # Note: -I takes the core root, because the source includes
-# "include/firelite.h" by relative path.
-$env:FIRELITE_DIR = "C:\Dev\libs\firelite"
-C:\Dev\msys64\ucrt64\bin\g++.exe -O2 -std=c++17 -I$env:FIRELITE_DIR benchmark.cpp -L$env:FIRELITE_DIR\target\release -lfirelite -o benchmark.exe
+# "include/hako.h" by relative path.
+$env:HAKODB_DIR = "C:\Dev\libs\firelite"
+C:\Dev\msys64\ucrt64\bin\g++.exe -O2 -std=c++17 -I$env:HAKODB_DIR benchmark.cpp -L$env:HAKODB_DIR\target\release -lhakodb -o benchmark.exe
 ```
 
-MinGW links directly against `firelite.dll`; no import-lib step needed.
+MinGW links directly against `hakodb.dll`; no import-lib step needed.
 
 ## Build (Windows, MSVC)
 
-rustc names the cdylib import library `firelite.dll.lib` (not
-`firelite.lib`) — link that file directly. A ready-made script is
+rustc names the cdylib import library `hakodb.dll.lib` (not
+`hakodb.lib`) — link that file directly. A ready-made script is
 included (`build-msvc.bat`, assumes VS2022 Community + a core release
 build side by side):
 
 ```bat
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-cl /O2 /std:c++17 /EHsc /IC:\Dev\libs\firelite benchmark.cpp /link /LIBPATH:C:\Dev\libs\firelite\target\release firelite.dll.lib /OUT:benchmark-msvc.exe
+cl /O2 /std:c++17 /EHsc /IC:\Dev\libs\firelite benchmark.cpp /link /LIBPATH:C:\Dev\libs\firelite\target\release hakodb.dll.lib /OUT:benchmark-msvc.exe
 ```
 
 Verified: MSVC-built harness passes `--gate` against the MSVC-built DLL
-with zero compiler warnings. At runtime `firelite.dll` must sit next to
+with zero compiler warnings. At runtime `hakodb.dll` must sit next to
 the exe (or on `PATH`). Release assets rename the import lib to the
-conventional `firelite.lib` — either name links the same way.
-Linux: `g++ -O2 -std=c++17 -I$FIRELITE_DIR/include benchmark.cpp
--L$FIRELITE_DIR/target/release -Wl,-rpath,'$ORIGIN' -lfirelite -o benchmark`.
+conventional `hakodb.lib` — either name links the same way.
+Linux: `g++ -O2 -std=c++17 -I$HAKODB_DIR/include benchmark.cpp
+-L$HAKODB_DIR/target/release -Wl,-rpath,'$ORIGIN' -lhakodb -o benchmark`.
 
 ## Run
 
@@ -65,7 +65,7 @@ For each profile it reports throughput (operations per second) and system metric
 | `Tx WPS` | Serializable transactions/sec |
 | `Bulk Upd/Del` | Bulk update and bulk delete ops/sec |
 | `Scan (Fwd/Rev)` | Full-table decoded scans both directions, docs/s |
-| `ScanRaw` (FireLite) / `ScanKey` (SQLite) | Byte/key-only full scans, docs/s |
+| `ScanRaw` (HakoDB) / `ScanKey` (SQLite) | Byte/key-only full scans, docs/s |
 | `Startup/Flush` | Engine open (ms) and clean shutdown (ms) |
 | `Size` | On-disk database size |
 
@@ -87,7 +87,7 @@ It runs six profiles across durability and workload mixes: `Always`, `Interval`,
 ./benchmark --gate
 
 # if the shared library is not on the default loader path (Linux/macOS)
-LD_LIBRARY_PATH=<firelite>/target/release ./benchmark --docs=1000
+LD_LIBRARY_PATH=<hakodb>/target/release ./benchmark --docs=1000
 ```
 
 Timing guidance: the suites print one line per profile/mode and go quiet
