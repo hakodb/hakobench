@@ -1,5 +1,7 @@
 # hakobench
 
+> Part of [**HakoDB**](https://github.com/hakodb/hakodb) — embedded Firestore-style document DB in Rust. The engine + C ABI live in `hakodb/hakodb`; this repo holds the benchmark harnesses.
+
 Official C++ benchmark harnesses for
 HakoDB. No CI here by design —
 run locally against a core build or a release tag asset.
