@@ -1,4 +1,4 @@
-#include "include/hakodb.h"
+#include "hakodb.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -87,9 +87,10 @@ struct Report {
     double offset_qps = 0;
     double cursor_qps = 0; 
     double agg_qps = 0;
-    double stress_get_rps = 0;
-    double stress_query_qps = 0;
-    double comp_query_qps = 0;
+    double stress_get_rps = 0;     
+    double stress_query_qps = 0; 
+    double comp_query_qps = 0; 
+    double json_qps = 0;
 
     // FULL SCANS (docs/s over live docs x iters)
     double scan_fwd_dps = 0;
@@ -137,6 +138,7 @@ static int check_gate(const Report& r) {
     need(r.stress_get_rps > 5000, "Get smoke", r.stress_get_rps, 5000);
     need(r.single_wps > 1000, "Single smoke", r.single_wps, 1000);
     need(r.tx_wps > 2000, "Tx smoke", r.tx_wps, 2000);
+    need(r.json_qps > 1000, "Json smoke", r.json_qps, 1000);
     // Relative invariants (guarded against div-by-zero via the smoke gates).
     if (r.comp_query_qps > 0)
         // ponytail: 0.85 tolerance, not 1.0 — at 20-row result sets both
@@ -151,6 +153,14 @@ static int check_gate(const Report& r) {
     if (r.stress_query_qps > 0)
         need(r.stress_get_rps > 5 * r.stress_query_qps, "Get>5xQry", r.stress_get_rps, r.stress_query_qps);
     else { need(false, "Get>5xQry", r.stress_get_rps, r.stress_query_qps); }
+    // ponytail: 0.2x, not parity — the JSON lane does plan+walk+decode
+    // (everything Qry does) PLUS per-doc serialization, so it inherently
+    // reads lower. The tripwire catches serialization regressions (e.g.
+    // someone reintroducing a Value DOM in the hot path); measured 0.32x
+    // on reference hardware, 0.2x leaves noise margin on weak boxes.
+    if (r.stress_query_qps > 0)
+        need(r.json_qps >= 0.2 * r.stress_query_qps, "Json>=0.2Qry", r.json_qps, r.stress_query_qps);
+    else { need(false, "Json>=0.2Qry", r.json_qps, r.stress_query_qps); }
     // ponytail: 0.5x, not 1.0x — in Manual (no fsync) batch and single do
     // nearly identical work per doc, so the relation is thin-margin noise
     // (observed median 0.82x on a loaded box, reps swinging 0.66-1.45x).
@@ -460,6 +470,25 @@ Report run_benchmark(BenchConfig cfg) {
     res.comp_query_qps = to_throughput(stress_loops, diff_ms(t_start));
     // cout << (int)res.comp_query_qps << " qps";
 
+    // 5b. JSON RENDER QPS — same shape as Qry above (tenant-2, limit 20)
+    // but every row goes through hk_doc_to_json (HakoDoc::write_json
+    // single-pass). Qry measures plan+walk+decode; this adds per-doc
+    // serialization on top, so it reads LOWER by construction — its job
+    // is tracking serialization wins over time, not beating Qry.
+    t_start = now();
+    for(int i=0; i<stress_loops; i++) {
+        UniqueQuery q(hk_query_new("bench"));
+        hk_query_where_eq_str(q.get(), "tenant", "tenant-2");
+        hk_query_limit(q.get(), 20);
+        UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
+        int n = hk_result_set_count(rs.get());
+        for(int j=0; j<n; j++) {
+            HK_Doc* d = hk_result_set_get_doc(rs.get(), j);
+            UniqueString js(hk_doc_to_json(d));
+        }
+    }
+    res.json_qps = to_throughput(stress_loops, diff_ms(t_start));
+
     // 6. AGGREGATION
     // stage("Aggregation QPS");
     UniqueQuery aq(hk_query_new("bench"));
@@ -666,6 +695,11 @@ int main(int argc, char** argv) {
              << " view " << setw(9) << (int)r.scan_view_dps
              << " (rows " << r.scan_rows << ")\n";
     }
+    cout << "\n--- JSON RENDER (per-doc hk_doc_to_json x20 over the Qry shape) ---\n";
+    for (const auto& r : results) {
+        cout << left << setw(14) << r.cfg.name
+             << " json " << setw(9) << (int)r.json_qps << "\n";
+    }
     } // end non-gate table
 
     if (gate) {
@@ -680,6 +714,7 @@ int main(int argc, char** argv) {
             reps.push_back(run_benchmark({"Manual", g_docs, 10, 2, 4, false, false, 4, false}));
             cout << "rep " << i << ": Qry " << (int)reps.back().stress_query_qps
                  << " Cmp " << (int)reps.back().comp_query_qps
+                 << " Json " << (int)reps.back().json_qps
                  << " Off " << (int)reps.back().offset_qps
                  << " Cur " << (int)reps.back().cursor_qps
                  << " Batch " << (int)reps.back().batch_wps
@@ -705,6 +740,7 @@ int main(int argc, char** argv) {
         m.stress_get_rps = med3(reps[0].stress_get_rps, reps[1].stress_get_rps, reps[2].stress_get_rps);
         m.stress_query_qps = med3(reps[0].stress_query_qps, reps[1].stress_query_qps, reps[2].stress_query_qps);
         m.comp_query_qps = med3(reps[0].comp_query_qps, reps[1].comp_query_qps, reps[2].comp_query_qps);
+        m.json_qps = med3(reps[0].json_qps, reps[1].json_qps, reps[2].json_qps);
         cout << "\n--- REGRESSION GATE (median Manual) ---\n";
         int fails = check_gate(m);
         cout << (fails == 0 ? "GATE RESULT: PASS\n" : "GATE RESULT: FAIL\n");

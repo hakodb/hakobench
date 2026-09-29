@@ -16,10 +16,11 @@ run locally against a core build or a release tag asset.
 
 ```sh
 # HAKODB_DIR points at a core checkout (default: ../hakodb).
-# Note: -I takes the core root, because the source includes
-# "include/hakodb.h" by relative path.
+# Note: -I takes the core's release dir, because the source includes
+# "hakodb.h" — generated per-target by build.rs next to the binaries
+# (there is no checked-in header since 0.9.1; each build carries its own).
 $env:HAKODB_DIR = "C:\Dev\libs\firelite"
-C:\Dev\msys64\ucrt64\bin\g++.exe -O2 -std=c++17 -I$env:HAKODB_DIR benchmark.cpp -L$env:HAKODB_DIR\target\release -lhakodb -o benchmark.exe
+C:\Dev\msys64\ucrt64\bin\g++.exe -O2 -std=c++17 -I$env:HAKODB_DIR\target\release benchmark.cpp -L$env:HAKODB_DIR\target\release -lhakodb -o benchmark.exe
 ```
 
 MinGW links directly against `hakodb.dll`; no import-lib step needed.
@@ -33,7 +34,7 @@ build side by side):
 
 ```bat
 call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-cl /O2 /std:c++17 /EHsc /IC:\Dev\libs\firelite benchmark.cpp /link /LIBPATH:C:\Dev\libs\firelite\target\release hakodb.dll.lib /OUT:benchmark-msvc.exe
+cl /O2 /std:c++17 /EHsc /IC:\Dev\libs\firelite\target\release benchmark.cpp /link /LIBPATH:C:\Dev\libs\firelite\target\release hakodb.dll.lib /OUT:benchmark-msvc.exe
 ```
 
 Verified: MSVC-built harness passes `--gate` against the MSVC-built DLL
