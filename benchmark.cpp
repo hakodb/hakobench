@@ -94,6 +94,7 @@ struct Report {
     double stress_query_qps = 0; 
     double comp_query_qps = 0; 
     double json_qps = 0;
+    double json_big_qps = 0;
 
     // FULL SCANS (docs/s over live docs x iters)
     double scan_fwd_dps = 0;
@@ -142,6 +143,7 @@ static int check_gate(const Report& r) {
     need(r.single_wps > 1000, "Single smoke", r.single_wps, 1000);
     need(r.tx_wps > 2000, "Tx smoke", r.tx_wps, 2000);
     need(r.json_qps > 1000, "Json smoke", r.json_qps, 1000);
+    need(r.json_big_qps > 1000, "JsonBig smoke", r.json_big_qps, 1000);
     // Relative invariants (guarded against div-by-zero via the smoke gates).
     if (r.comp_query_qps > 0)
         // ponytail: 0.85 tolerance, not 1.0 — at 20-row result sets both
@@ -493,6 +495,23 @@ Report run_benchmark(BenchConfig cfg) {
     }
     res.json_qps = to_throughput(stress_loops, diff_ms(t_start));
 
+    // 5c. JSON RENDER, BIG DOC — one 7 KB-HTML doc rendered in a tight loop.
+    // The 5b lane above only covers small docs (write_json arm); this one
+    // fires the adaptive emit's serde arm (hk_doc_to_json picks per doc).
+    // Report + smoke floor; no relative tripwire until the baseline band
+    // is recorded on reference hardware.
+    t_start = now();
+    {
+        UniqueDoc big(hk_doc_new());
+        hk_doc_insert_str(big.get(), "title", "Bagaimana Parasetamol Dibuat?");
+        string html;
+        for (int k = 0; k < 40; k++) html += "<p>Pernahkah Anda sakit kepala, menelan sebutir parasetamol?</p>";
+        hk_doc_insert_str(big.get(), "content", html.c_str());
+        hk_doc_insert_int(big.get(), "views", 123456);
+        for(int i=0; i<stress_loops; i++) UniqueString js(hk_doc_to_json(big.get()));
+    }
+    res.json_big_qps = to_throughput(stress_loops, diff_ms(t_start));
+
     // 6. AGGREGATION
     // stage("Aggregation QPS");
     UniqueQuery aq(hk_query_new("bench"));
@@ -705,7 +724,8 @@ int main(int argc, char** argv) {
     cout << "\n--- JSON RENDER (per-doc hk_doc_to_json x20 over the Qry shape) ---\n";
     for (const auto& r : results) {
         cout << left << setw(14) << r.cfg.name
-             << " json " << setw(9) << (int)r.json_qps << "\n";
+             << " json " << setw(9) << (int)r.json_qps
+             << " json_big " << setw(9) << (int)r.json_big_qps << "\n";
     }
     } // end non-gate table
 
@@ -722,6 +742,7 @@ int main(int argc, char** argv) {
             cout << "rep " << i << ": Qry " << (int)reps.back().stress_query_qps
                  << " Cmp " << (int)reps.back().comp_query_qps
                  << " Json " << (int)reps.back().json_qps
+                 << " JsonBig " << (int)reps.back().json_big_qps
                  << " Off " << (int)reps.back().offset_qps
                  << " Cur " << (int)reps.back().cursor_qps
                  << " Batch " << (int)reps.back().batch_wps
@@ -748,6 +769,7 @@ int main(int argc, char** argv) {
         m.stress_query_qps = med3(reps[0].stress_query_qps, reps[1].stress_query_qps, reps[2].stress_query_qps);
         m.comp_query_qps = med3(reps[0].comp_query_qps, reps[1].comp_query_qps, reps[2].comp_query_qps);
         m.json_qps = med3(reps[0].json_qps, reps[1].json_qps, reps[2].json_qps);
+        m.json_big_qps = med3(reps[0].json_big_qps, reps[1].json_big_qps, reps[2].json_big_qps);
         cout << "\n--- REGRESSION GATE (median Manual) ---\n";
         int fails = check_gate(m);
         cout << (fails == 0 ? "GATE RESULT: PASS\n" : "GATE RESULT: FAIL\n");
