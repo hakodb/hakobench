@@ -498,8 +498,10 @@ Report run_benchmark(BenchConfig cfg) {
     // 5c. JSON RENDER, BIG DOC — one 7 KB-HTML doc rendered in a tight loop.
     // The 5b lane above only covers small docs (write_json arm); this one
     // fires the adaptive emit's serde arm (hk_doc_to_json picks per doc).
-    // Report + smoke floor; no relative tripwire until the baseline band
-    // is recorded on reference hardware.
+    // 3000 iterations (not stress_loops): a single 7 KB render is ~30µs,
+    // so 300 would time 9 ms of mostly loop overhead — this lane needs its
+    // own count for a stable number. Report + smoke floor; no relative
+    // tripwire until the baseline band is recorded on reference hardware.
     t_start = now();
     {
         UniqueDoc big(hk_doc_new());
@@ -508,9 +510,9 @@ Report run_benchmark(BenchConfig cfg) {
         for (int k = 0; k < 40; k++) html += "<p>Pernahkah Anda sakit kepala, menelan sebutir parasetamol?</p>";
         hk_doc_insert_str(big.get(), "content", html.c_str());
         hk_doc_insert_int(big.get(), "views", 123456);
-        for(int i=0; i<stress_loops; i++) UniqueString js(hk_doc_to_json(big.get()));
+        for(int i=0; i<3000; i++) UniqueString js(hk_doc_to_json(big.get()));
     }
-    res.json_big_qps = to_throughput(stress_loops, diff_ms(t_start));
+    res.json_big_qps = to_throughput(3000, diff_ms(t_start));
 
     // 6. AGGREGATION
     // stage("Aggregation QPS");
