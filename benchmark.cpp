@@ -633,6 +633,7 @@ int main(int argc, char** argv) {
     uint64_t wal_reserve_mb = 0;
     bool no_maintenance = false;
     uint64_t interval_ms = 0;
+    bool force_large_docs = false;
     for (int i = 1; i < argc; i++) {
         string a = argv[i];
         if (a.find("--docs=") == 0) g_docs = stoi(a.substr(7));
@@ -641,6 +642,7 @@ int main(int argc, char** argv) {
         if (a == "--gate") gate = true;
         if (a.find("--wal-reserve-mb=") == 0) wal_reserve_mb = stoull(a.substr(17));
         if (a == "--no-maintenance") no_maintenance = true;
+        if (a == "--large-docs") force_large_docs = true;
         if (a.find("--interval-ms=") == 0) interval_ms = stoull(a.substr(14));
     }
     g_wstats_enabled = wstats;
@@ -658,6 +660,9 @@ int main(int argc, char** argv) {
     for (auto& cfg : suite) cfg.wal_reserve_bytes = wal_reserve_mb * 1024ULL * 1024ULL;
     for (auto& cfg : suite) cfg.no_maintenance = no_maintenance;
     for (auto& cfg : suite) cfg.interval_ms = interval_ms;
+    // Blob-on-any-durability: 50 KB payloads (>16 KB threshold) through the
+    // selected profiles (default suite keeps Gaming as the blob profile).
+    if (force_large_docs) for (auto& cfg : suite) cfg.large_docs = true;
 
     cout << "============================================================================================\n";
     cout << " FIRE LITE PERFORMANCE MATRIX (v0.7.6) | THROUGHPUT MODE (Ops/Sec) | Total Docs: " << g_docs << "\n";
