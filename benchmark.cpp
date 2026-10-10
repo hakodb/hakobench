@@ -361,6 +361,11 @@ Report run_benchmark(BenchConfig cfg) {
             this_thread::sleep_for(chrono::milliseconds(20));
         }
     }
+    // ponytail: readiness is NOT quiescence — the async index worker may
+    // still hold batch puts (fast boxes outrun it and then benchmark
+    // empty postings: box-observed 543k phantom Qry at docs=300 vs 70k
+    // real on rerun). Settle everything before measuring reads.
+    hk_engine_await_quiescent(db, 60000);
     // cout << "Done";
 
     // 2. READ TEST
