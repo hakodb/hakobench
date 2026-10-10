@@ -4,3 +4,5 @@
 *.dll
 bench_data_*
 sqlite_bench_data_*
+target/
+duel-result-*.json
