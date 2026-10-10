@@ -330,8 +330,9 @@ Report run_benchmark(BenchConfig cfg) {
 
     // stage("Batch Write WPS");
     t_start = now();
-    // ponytail: --docs<=100 leaves zero batch docs; the (i+j)%b_total
-    // below SIGFPEs on b_total==0 (box-observed). Skip instead of crash.
+    // ponytail: --docs<=100 leaves zero batch docs; guard the loop
+    // (and the stress-get modulo below) against b_total==0
+    // (box-observed SIGFPE). Skip instead of crash.
     int b_total = cfg.total_docs - 100;
     if (b_total < 0) b_total = 0;
     for (int i = 0; i < b_total; i += cfg.batch_size) {
@@ -446,10 +447,14 @@ Report run_benchmark(BenchConfig cfg) {
     // stage("Stress GET RPS");
     t_start = now();
     int stress_loops = 300;
+    // ponytail: b_total==0 (--docs<=100) — stress over the
+    // single-written s_* docs instead of crashing on %0.
+    int get_n = b_total > 0 ? b_total : s_write_count;
+    const char* get_fmt = b_total > 0 ? "b_%d" : "s_%d";
     for(int i=0; i<stress_loops; i++) {
         for(int j=0; j<50; j++) {
             char key_buf[16];
-            snprintf(key_buf, sizeof(key_buf), "b_%d", (i + j) % b_total);
+            snprintf(key_buf, sizeof(key_buf), get_fmt, (i + j) % get_n);
             UniqueDoc d(hk_engine_get(db, "bench", key_buf));
         }
     }
