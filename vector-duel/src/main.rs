@@ -344,7 +344,7 @@ async fn main() {
         .map(|_| (0..args.dim).map(|_| qrng.next_f32()).collect())
         .collect();
 
-    println!("[1/2] hakodb 0.13.0 ...");
+    println!("[1/2] hakodb (dep version in Cargo.toml) ...");
     let h = bench_hakodb_indexed(args.docs, args.dim, args.k, &qs, &pts);
     println!("[2/2] libsql/turso ...");
     let t = bench_libsql(args.docs, args.dim, args.k, &qs, &pts).await;
