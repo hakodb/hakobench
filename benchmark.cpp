@@ -330,7 +330,10 @@ Report run_benchmark(BenchConfig cfg) {
 
     // stage("Batch Write WPS");
     t_start = now();
+    // ponytail: --docs<=100 leaves zero batch docs; the (i+j)%b_total
+    // below SIGFPEs on b_total==0 (box-observed). Skip instead of crash.
     int b_total = cfg.total_docs - 100;
+    if (b_total < 0) b_total = 0;
     for (int i = 0; i < b_total; i += cfg.batch_size) {
         UniqueBatch b(hk_batch_new());
         int chunk = min(cfg.batch_size, b_total - i);
