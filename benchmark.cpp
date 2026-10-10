@@ -691,13 +691,14 @@ struct VectorReport {
     bool success = true;
 };
 
-static int run_vector_benchmark(int n_docs, int dim, int k, int n_queries, VectorReport& r) {
+static int run_vector_benchmark(int n_docs, int dim, int k, int n_queries, bool no_maintenance, VectorReport& r) {
     string path = "./bench_data_vec";
     try { fs::remove_all(path); } catch (...) {}
 
     HK_Config* cfg = hk_config_new();
     hk_config_set_durability(cfg, 1); // Interval, duel parity with vector-duel
     hk_config_set_query_workers(cfg, 4);
+    if (no_maintenance) hk_config_set_background_maintenance(cfg, false);
     HK_Engine* db = hk_engine_open_with_config(path.c_str(), cfg);
     if (!db) { r.success = false; return 1; }
     // NOTE: hk_engine_open_with_config takes config ownership (mirrors
@@ -873,8 +874,9 @@ int main(int argc, char** argv) {
     if (vector_mode) {
         VectorReport vr;
         cout << "VECTOR (C ABI): docs=" << g_docs << " dim=" << vdim
-             << " k=" << vk << " queries=" << vqueries << "\n";
-        if (run_vector_benchmark(g_docs, vdim, vk, vqueries, vr) != 0 || !vr.success) {
+             << " k=" << vk << " queries=" << vqueries
+             << (no_maintenance ? " [no-maintenance]" : "") << "\n";
+        if (run_vector_benchmark(g_docs, vdim, vk, vqueries, no_maintenance, vr) != 0 || !vr.success) {
             cout << "VECTOR FAILED\n";
             return 1;
         }
