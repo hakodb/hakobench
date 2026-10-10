@@ -844,6 +844,76 @@ static int run_vector_benchmark(int n_docs, int dim, int k, int n_queries, bool 
     return 0;
 }
 
+// Sustained-load tail probe: back-to-back pointer-lane queries for
+// `soak_s` seconds (covers many 5s ticks + the 3-skip shed bound, so
+// maintenance provably runs mid-load). Reports count/p50/p99/max —
+// if shedding only helps bursts, p99 here climbs back toward the
+// pre-shed baseline (~14ms); if it holds ~10ms the bound is fine.
+static int run_vector_soak(int n_docs, int dim, int k, int soak_s) {
+    string path = "./bench_data_vec";
+    try { fs::remove_all(path); } catch (...) {}
+
+    HK_Config* cfg = hk_config_new();
+    hk_config_set_durability(cfg, 1);
+    hk_config_set_query_workers(cfg, 4);
+    HK_Engine* db = hk_engine_open_with_config(path.c_str(), cfg);
+    if (!db) return 1;
+
+    v_rng_state = 0xD0E1u;
+    for (int i = 0; i < n_docs; i += 1000) {
+        UniqueBatch b(hk_batch_new());
+        int chunk = min(1000, n_docs - i);
+        for (int j = 0; j < chunk; j++) {
+            UniqueDoc d(hk_doc_new());
+            vector<float> v(dim);
+            for (int dd = 0; dd < dim; dd++) v[dd] = v_rand_f32();
+            hk_doc_insert_bin(d.get(), "emb", reinterpret_cast<const uint8_t*>(v.data()), dim * sizeof(float));
+            char key[24];
+            snprintf(key, sizeof(key), "v_%d", i + j);
+            hk_batch_set(b.get(), "docs", key, d.get());
+        }
+        hk_batch_commit(db, b.get());
+    }
+    if (hk_engine_create_vector_index(db, "docs", "emb", (uint32_t)dim, 0) != 0) return 1;
+    {
+        auto t_ready = now();
+        while (!hk_engine_is_indexes_ready(db)) {
+            if (diff_ms(t_ready) > 60000) break;
+            this_thread::sleep_for(chrono::milliseconds(20));
+        }
+        hk_engine_await_quiescent(db, 300000);
+    }
+
+    vector<double> lats;
+    lats.reserve(20000);
+    volatile size_t sink = 0;
+    auto t_end = now() + chrono::seconds(soak_s);
+    int qi = 0;
+    // Queries cycle a fixed pool (fresh vectors each iter would measure
+    // RNG+alloc, not the engine).
+    vector<vector<float>> pool(16, vector<float>(dim));
+    for (auto& v : pool)
+        for (int d = 0; d < dim; d++) v[d] = v_rand_f32();
+    while (now() < t_end) {
+        const vector<float>& qv = pool[qi++ % pool.size()];
+        UniqueQuery q(hk_query_new("docs"));
+        hk_query_where_near(q.get(), "emb", qv.data(), dim);
+        hk_query_limit(q.get(), k);
+        auto t = now();
+        UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
+        sink += hk_result_set_count(rs.get());
+        lats.push_back(diff_ms(t));
+    }
+    if (sink == 0xDEADBEEFu) cout << sink;
+    sort(lats.begin(), lats.end());
+    auto pct = [&](double p) { return lats[(size_t)(lats.size() * p) < lats.size() ? (size_t)(lats.size() * p) : lats.size() - 1]; };
+    cout << "soak " << soak_s << "s: n=" << lats.size()
+         << " p50=" << fixed << setprecision(2) << pct(0.50)
+         << " p99=" << pct(0.99) << " max=" << lats.back() << "ms\n";
+    hk_engine_free(db);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     int g_docs = 1000;
     string only_profile;
@@ -854,7 +924,7 @@ int main(int argc, char** argv) {
     uint64_t interval_ms = 0;
     bool force_large_docs = false;
     bool vector_mode = false;
-    int vdim = 384, vk = 10, vqueries = 100;
+    int vdim = 384, vk = 10, vqueries = 100, soak_s = 0;
     for (int i = 1; i < argc; i++) {
         string a = argv[i];
         if (a.find("--docs=") == 0) g_docs = stoi(a.substr(7));
@@ -869,8 +939,12 @@ int main(int argc, char** argv) {
         if (a.find("--vdim=") == 0) vdim = stoi(a.substr(7));
         if (a.find("--vk=") == 0) vk = stoi(a.substr(5));
         if (a.find("--vqueries=") == 0) vqueries = stoi(a.substr(11));
+        if (a.find("--soak=") == 0) soak_s = stoi(a.substr(7));
     }
     g_wstats_enabled = wstats;
+    if (soak_s > 0) {
+        return run_vector_soak(g_docs, vdim, vk, soak_s);
+    }
     if (vector_mode) {
         VectorReport vr;
         cout << "VECTOR (C ABI): docs=" << g_docs << " dim=" << vdim
