@@ -15,6 +15,9 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 
 namespace fs = std::filesystem;
@@ -34,6 +37,7 @@ struct HKDeleter {
     void operator()(HK_Array* p) const { if (p) hk_array_free(p); }
     void operator()(char* p) const { if (p) hk_string_free(p); }
     void operator()(HK_ResultSet* p) const { if (p) hk_result_set_free(p); }
+    void operator()(HK_RawResultSet* p) const { if (p) hk_rawresult_free(p); }
 };
 
 using UniqueDoc = unique_ptr<HK_Doc, HKDeleter>;
@@ -45,6 +49,7 @@ using UniqueWatch = unique_ptr<HK_Watch, HKDeleter>;
 using UniqueTx = unique_ptr<HK_Transaction, HKDeleter>;
 using UniqueArray = unique_ptr<HK_Array, HKDeleter>;
 using UniqueResultSet = unique_ptr<HK_ResultSet, HKDeleter>;
+using UniqueRawResultSet = unique_ptr<HK_RawResultSet, HKDeleter>;
 
 // ============================================================
 // DATA STRUCTURES
@@ -625,6 +630,219 @@ Report run_benchmark(BenchConfig cfg) {
 // MAIN SUITE
 // ============================================================
 
+// ============================================================
+// VECTOR DUEL (C ABI): insert + HNSW build + read-path lanes
+// (--vector; pairs with turso_bench.cpp over sqld/HTTP).
+// Same xorshift fixtures both sides; recall vs in-harness exact
+// cosine oracle. Lanes per query separate cheap handoff from
+// consumer end-result:
+//   pointer : handles + count only (no doc touch)
+//   raw     : raw bytes walk (opaque store encoding + ids)
+//   json    : per-doc hk_doc_to_json (streaming consumer form)
+//   jsonbulk: hk_result_set_to_json (bulk consumer form)
+//   jsonstr : hk_query_execute full JSON string (heaviest form)
+// ============================================================
+
+static uint64_t v_rng_state = 0xD0E1u;
+static float v_rand_f32() {
+    v_rng_state ^= v_rng_state << 13;
+    v_rng_state ^= v_rng_state >> 7;
+    v_rng_state ^= v_rng_state << 17;
+    return (float)((v_rng_state >> 11) * (1.0 / 9007199254740992.0) * 2.0 - 1.0);
+}
+
+static double v_cosine(const vector<float>& a, const vector<float>& b) {
+    double dot = 0, na = 0, nb = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+        double x = a[i], y = b[i];
+        dot += x * y; na += x * x; nb += y * y;
+    }
+    double d = sqrt(na) * sqrt(nb);
+    return d == 0 ? 1.0 : 1.0 - dot / d;
+}
+
+// Exact top-k doc indices (id == index; keys are v_<index>).
+static vector<int> v_brute_top(const vector<float>& q, const vector<vector<float>>& pts, int k) {
+    vector<pair<double,int>> s;
+    s.reserve(pts.size());
+    for (size_t i = 0; i < pts.size(); i++) s.emplace_back(v_cosine(q, pts[i]), (int)i);
+    sort(s.begin(), s.end(), [](const auto& a, const auto& b) {
+        return a.first != b.first ? a.first < b.first : a.second < b.second;
+    });
+    vector<int> out;
+    for (int i = 0; i < k && i < (int)s.size(); i++) out.push_back(s[i].second);
+    return out;
+}
+
+static double v_pct(vector<double> v, double p) {
+    sort(v.begin(), v.end());
+    return v[(size_t)(v.size() * p) < v.size() ? (size_t)(v.size() * p) : v.size() - 1];
+}
+
+struct VectorReport {
+    double insert_s = 0, wps = 0, build_s = 0;
+    double ptr_p50 = 0, ptr_p99 = 0;
+    double raw_p50 = 0, raw_p99 = 0;
+    double json_p50 = 0, json_p99 = 0;
+    double bulk_p50 = 0, bulk_p99 = 0;
+    double str_p50 = 0, str_p99 = 0;
+    double recall = 0;
+    double size_mb = 0;
+    bool success = true;
+};
+
+static int run_vector_benchmark(int n_docs, int dim, int k, int n_queries, VectorReport& r) {
+    string path = "./bench_data_vec";
+    try { fs::remove_all(path); } catch (...) {}
+
+    HK_Config* cfg = hk_config_new();
+    hk_config_set_durability(cfg, 1); // Interval, duel parity with vector-duel
+    hk_config_set_query_workers(cfg, 4);
+    HK_Engine* db = hk_engine_open_with_config(path.c_str(), cfg);
+    if (!db) { r.success = false; return 1; }
+    // NOTE: hk_engine_open_with_config takes config ownership (mirrors
+    // run_benchmark: no hk_config_free after open).
+
+    // Fixtures (kept in RAM as the shared oracle input).
+    v_rng_state = 0xD0E1u;
+    vector<vector<float>> pts(n_docs, vector<float>(dim));
+    for (int i = 0; i < n_docs; i++)
+        for (int d = 0; d < dim; d++) pts[i][d] = v_rand_f32();
+    vector<vector<float>> queries(n_queries, vector<float>(dim));
+    for (int q = 0; q < n_queries; q++)
+        for (int d = 0; d < dim; d++) queries[q][d] = v_rand_f32();
+
+    // Seed x1000 batches: emb as LE-f32 binary (native LE assumed).
+    auto t0 = now();
+    for (int i = 0; i < n_docs; i += 1000) {
+        UniqueBatch b(hk_batch_new());
+        int chunk = min(1000, n_docs - i);
+        for (int j = 0; j < chunk; j++) {
+            UniqueDoc d(hk_doc_new());
+            const float* fp = pts[i + j].data();
+            hk_doc_insert_bin(d.get(), "emb", reinterpret_cast<const uint8_t*>(fp), dim * sizeof(float));
+            char key[24];
+            snprintf(key, sizeof(key), "v_%d", i + j);
+            hk_batch_set(b.get(), "docs", key, d.get());
+        }
+        hk_batch_commit(db, b.get());
+    }
+    r.insert_s = diff_ms(t0) / 1000.0;
+    r.wps = n_docs / r.insert_s;
+
+    // Build.
+    t0 = now();
+    if (hk_engine_create_vector_index(db, "docs", "emb", (uint32_t)dim, 0) != 0) { r.success = false; return 1; }
+    {
+        auto t_ready = now();
+        while (!hk_engine_is_indexes_ready(db)) {
+            if (diff_ms(t_ready) > 60000) break;
+            this_thread::sleep_for(chrono::milliseconds(20));
+        }
+        if (!hk_engine_await_quiescent(db, 300000)) { r.success = false; return 1; }
+    }
+    r.build_s = diff_ms(t0) / 1000.0;
+
+    // Warmup.
+    for (int q = 0; q < min(5, n_queries); q++) {
+        UniqueQuery wq(hk_query_new("docs"));
+        hk_query_where_near(wq.get(), "emb", queries[q].data(), dim);
+        hk_query_limit(wq.get(), k);
+        UniqueResultSet wrs(hk_query_execute_to_handles(db, wq.get()));
+    }
+
+    vector<double> l_ptr, l_raw, l_json, l_bulk, l_str;
+    long hits = 0;
+    volatile size_t sink = 0;
+    for (int qi = 0; qi < n_queries; qi++) {
+        const vector<float>& qv = queries[qi];
+        // -- pointer lane: handles + count.
+        {
+            UniqueQuery q(hk_query_new("docs"));
+            hk_query_where_near(q.get(), "emb", qv.data(), dim);
+            hk_query_limit(q.get(), k);
+            auto t = now();
+            UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
+            sink += hk_result_set_count(rs.get());
+            l_ptr.push_back(diff_ms(t));
+        }
+        // -- raw lane: opaque bytes + ids walked.
+        vector<int> got_ids;
+        {
+            UniqueQuery q(hk_query_new("docs"));
+            hk_query_where_near(q.get(), "emb", qv.data(), dim);
+            hk_query_limit(q.get(), k);
+            auto t = now();
+            UniqueRawResultSet rs(hk_query_execute_raw(db, q.get()));
+            size_t n = hk_rawresult_count(rs.get());
+            for (size_t i = 0; i < n; i++) {
+                HK_RawDoc* rd = hk_rawresult_get(rs.get(), i);
+                uintptr_t bl = 0, il = 0;
+                const uint8_t* bytes = hk_rawdoc_bytes(rd, &bl);
+                const char* id = hk_rawdoc_id(rd, &il);
+                for (size_t b = 0; b < min<size_t>(bl, 16); b++) sink += bytes[b];
+                // keys are v_<index> — parse for recall membership.
+                int idx = atoi(id + 2);
+                got_ids.push_back(idx);
+                sink += il;
+            }
+            l_raw.push_back(diff_ms(t));
+        }
+        // -- json lane: per-doc consumer form.
+        {
+            UniqueQuery q(hk_query_new("docs"));
+            hk_query_where_near(q.get(), "emb", qv.data(), dim);
+            hk_query_limit(q.get(), k);
+            auto t = now();
+            UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
+            size_t n = hk_result_set_count(rs.get());
+            for (size_t i = 0; i < n; i++) {
+                HK_Doc* d = hk_result_set_get_doc(rs.get(), i);
+                UniqueString js(hk_doc_to_json(d));
+                if (js) sink += strlen(js.get());
+            }
+            l_json.push_back(diff_ms(t));
+        }
+        // -- jsonbulk lane: one bulk consumer string.
+        {
+            UniqueQuery q(hk_query_new("docs"));
+            hk_query_where_near(q.get(), "emb", qv.data(), dim);
+            hk_query_limit(q.get(), k);
+            auto t = now();
+            UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
+            UniqueString js(hk_result_set_to_json(rs.get()));
+            if (js) sink += strlen(js.get());
+            l_bulk.push_back(diff_ms(t));
+        }
+        // -- jsonstr lane: full JSON string straight from execute.
+        {
+            UniqueQuery q(hk_query_new("docs"));
+            hk_query_where_near(q.get(), "emb", qv.data(), dim);
+            hk_query_limit(q.get(), k);
+            auto t = now();
+            UniqueString js(hk_query_execute(db, q.get()));
+            if (js) sink += strlen(js.get());
+            l_str.push_back(diff_ms(t));
+        }
+        vector<int> want = v_brute_top(qv, pts, k);
+        for (int id : got_ids)
+            if (find(want.begin(), want.end(), id) != want.end()) hits++;
+    }
+    if (sink == 0xDEADBEEFu) cout << sink;
+    r.recall = (double)hits / (n_queries * k);
+    r.ptr_p50 = v_pct(l_ptr, 0.50); r.ptr_p99 = v_pct(l_ptr, 0.99);
+    r.raw_p50 = v_pct(l_raw, 0.50); r.raw_p99 = v_pct(l_raw, 0.99);
+    r.json_p50 = v_pct(l_json, 0.50); r.json_p99 = v_pct(l_json, 0.99);
+    r.bulk_p50 = v_pct(l_bulk, 0.50); r.bulk_p99 = v_pct(l_bulk, 0.99);
+    r.str_p50 = v_pct(l_str, 0.50); r.str_p99 = v_pct(l_str, 0.99);
+    r.size_mb = get_dir_size(path) / 1048576.0;
+
+    t0 = now();
+    hk_engine_free(db);
+    (void)t0;
+    return 0;
+}
+
 int main(int argc, char** argv) {
     int g_docs = 1000;
     string only_profile;
@@ -634,6 +852,8 @@ int main(int argc, char** argv) {
     bool no_maintenance = false;
     uint64_t interval_ms = 0;
     bool force_large_docs = false;
+    bool vector_mode = false;
+    int vdim = 384, vk = 10, vqueries = 100;
     for (int i = 1; i < argc; i++) {
         string a = argv[i];
         if (a.find("--docs=") == 0) g_docs = stoi(a.substr(7));
@@ -644,8 +864,32 @@ int main(int argc, char** argv) {
         if (a == "--no-maintenance") no_maintenance = true;
         if (a == "--large-docs") force_large_docs = true;
         if (a.find("--interval-ms=") == 0) interval_ms = stoull(a.substr(14));
+        if (a == "--vector") vector_mode = true;
+        if (a.find("--vdim=") == 0) vdim = stoi(a.substr(7));
+        if (a.find("--vk=") == 0) vk = stoi(a.substr(5));
+        if (a.find("--vqueries=") == 0) vqueries = stoi(a.substr(11));
     }
     g_wstats_enabled = wstats;
+    if (vector_mode) {
+        VectorReport vr;
+        cout << "VECTOR (C ABI): docs=" << g_docs << " dim=" << vdim
+             << " k=" << vk << " queries=" << vqueries << "\n";
+        if (run_vector_benchmark(g_docs, vdim, vk, vqueries, vr) != 0 || !vr.success) {
+            cout << "VECTOR FAILED\n";
+            return 1;
+        }
+        cout << fixed << setprecision(2);
+        cout << "insert: " << vr.insert_s << "s (" << (int)vr.wps << " wps)  build: "
+             << vr.build_s << "s  recall@" << vk << ": " << setprecision(4) << vr.recall
+             << setprecision(2) << "  size: " << vr.size_mb << "MB\n";
+        cout << "lane     p50/ms  p99/ms\n";
+        cout << "pointer  " << vr.ptr_p50 << "  " << vr.ptr_p99 << "\n";
+        cout << "raw      " << vr.raw_p50 << "  " << vr.raw_p99 << "\n";
+        cout << "json     " << vr.json_p50 << "  " << vr.json_p99 << "\n";
+        cout << "jsonbulk " << vr.bulk_p50 << "  " << vr.bulk_p99 << "\n";
+        cout << "jsonstr  " << vr.str_p50 << "  " << vr.str_p99 << "\n";
+        return 0;
+    }
     // Gate mode: Manual profile only (fast, covers all gated shapes).
     if (gate) only_profile = "Manual";
 

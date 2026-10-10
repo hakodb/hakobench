@@ -1,0 +1,18 @@
+[package]
+name = "turso-shim"
+version = "0.1.0"
+edition = "2021"
+
+# Bench-only C ABI over embedded libsql (Turso). libsql has no C/C++
+# client API, so this 5-function shim keeps the Turso side embedded
+# while turso_bench.cpp drives it like benchmark.cpp drives hakodb.
+# NOT a general binding: SQL strings in, ids out, nothing else.
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+
+[dependencies]
+libsql = "0.9"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
