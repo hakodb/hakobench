@@ -118,6 +118,10 @@ struct Report {
 
 std::atomic<size_t> g_snapshot_received{0};
 static bool g_wstats_enabled = false;
+// ponytail: Agg-only isolation (diagnosis, not a profile) — seed +
+// quiesce + Agg lane + shutdown, skipping every other lane. Answers
+// whether Agg cost comes from prior-lane state or the dataset itself.
+static bool g_agg_only = false;
 
 // Print + reset the engine's write-phase counters (hk_debug_write_stats).
 static void dump_wstats(const char* tag) {
@@ -372,6 +376,10 @@ Report run_benchmark(BenchConfig cfg) {
     hk_engine_await_quiescent(db, 60000);
     // cout << "Done";
 
+    // Agg-only isolation: skip straight to the Agg lane (seed +
+    // quiescence already done above).
+    if (g_agg_only) goto agg_lane;
+
     // 2. READ TEST
     // stage("Point Read RPS (Seq)");
     t_start = now();
@@ -538,6 +546,7 @@ Report run_benchmark(BenchConfig cfg) {
 
     // 6. AGGREGATION
     // stage("Aggregation QPS");
+agg_lane:;
     // ponytail: sum over the NUMERIC indexed field (fast path: per-bucket
     // val x count, O(70 buckets)). sum("id") measured parse-failures on
     // string keys (always 0.0) — same O(N) walk, zero meaning.
@@ -546,6 +555,12 @@ Report run_benchmark(BenchConfig cfg) {
     t_start = now(); 
     for(int i=0; i<50; i++) UniqueString agg_result(hk_query_execute_aggregation(db, aq.get())); 
     res.agg_qps = to_throughput(50, diff_ms(t_start));
+    // TEMP-DIAG (never merge): print the actual sum once (correctness
+    // of whatever path produced the timing above).
+    {
+        UniqueString v(hk_query_execute_aggregation(db, aq.get()));
+        cout << "[agg-value=" << (v ? v.get() : "null") << "]";
+    }
     // cout << (int)res.agg_qps << " qps";
 
     // 6b. FULL-SCAN TRIO — mirrors sqlite_bench.cpp scan block 1:1.
