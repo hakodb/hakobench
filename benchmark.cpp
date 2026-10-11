@@ -309,6 +309,10 @@ Report run_benchmark(BenchConfig cfg) {
     hk_engine_create_simple_index(db, "bench", "active"); 
     hk_engine_create_simple_index(db, "bench", "tenant"); 
     hk_engine_create_simple_index(db, "bench", "id"); 
+    // ponytail: numeric simple index for the Agg lane — sum(age) rides
+    // the indexed fast path (O(70 buckets), N-independent) instead of
+    // sum("id") which walks every bucket failing parses (always 0.0).
+    hk_engine_create_simple_index(db, "bench", "age");
     hk_engine_create_index(db, "bench", "[{\"field\": \"id\", \"desc\": false}]");
     hk_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"score\", \"desc\": true}]");
     // cout << "Ready";
@@ -534,8 +538,11 @@ Report run_benchmark(BenchConfig cfg) {
 
     // 6. AGGREGATION
     // stage("Aggregation QPS");
+    // ponytail: sum over the NUMERIC indexed field (fast path: per-bucket
+    // val x count, O(70 buckets)). sum("id") measured parse-failures on
+    // string keys (always 0.0) — same O(N) walk, zero meaning.
     UniqueQuery aq(hk_query_new("bench"));
-    hk_query_aggregate_sum(aq.get(), "id");
+    hk_query_aggregate_sum(aq.get(), "age");
     t_start = now(); 
     for(int i=0; i<50; i++) UniqueString agg_result(hk_query_execute_aggregation(db, aq.get())); 
     res.agg_qps = to_throughput(50, diff_ms(t_start));
