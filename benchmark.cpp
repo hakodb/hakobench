@@ -285,6 +285,17 @@ HK_Config* create_config_ptr(const BenchConfig& cfg) {
 
 void stage(const string& s) { cout << "\n      -> [STAGE] " << left << setw(28) << s << " ... " << flush; }
 
+static int check(int rc, const char* what) {
+    // ponytail: every FFI mutator checked — silent -1s used to hide
+    // broken setup (missing indexes, failed commits) behind plausible
+    // numbers. A setup failure aborts the profile loudly instead.
+    if (rc != 0) {
+        const char* e = hk_last_error();
+        cout << "SETUP-FAIL " << what << ": rc=" << rc << " err=" << (e ? e : "?") << "\n";
+    }
+    return rc;
+}
+
 // ============================================================
 // CORE BENCHMARK CYCLE
 // ============================================================
@@ -310,13 +321,15 @@ Report run_benchmark(BenchConfig cfg) {
     // cout << "ACTIVE";
 
     // stage("Indexing..");
-    hk_engine_create_simple_index(db, "bench", "active"); 
-    hk_engine_create_simple_index(db, "bench", "tenant"); 
-    hk_engine_create_simple_index(db, "bench", "id"); 
-    // ponytail: numeric simple index for the Agg lane — sum(age) rides
-    // the indexed fast path (O(70 buckets), N-independent) instead of
-    // sum("id") which walks every bucket failing parses (always 0.0).
-    hk_engine_create_simple_index(db, "bench", "age");
+    if (check(hk_engine_create_simple_index(db, "bench", "active"), "create:active")
+        | check(hk_engine_create_simple_index(db, "bench", "tenant"), "create:tenant")
+        | check(hk_engine_create_simple_index(db, "bench", "id"), "create:id")
+        // ponytail: numeric simple index for the Agg lane — sum(age) rides
+        // the indexed fast path (O(70 buckets), N-independent) instead of
+        // sum("id") which walks every bucket failing parses (always 0.0).
+        | check(hk_engine_create_simple_index(db, "bench", "age"), "create:age")) {
+        res.success = false; return res;
+    }
     hk_engine_create_index(db, "bench", "[{\"field\": \"id\", \"desc\": false}]");
     hk_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"score\", \"desc\": true}]");
     // cout << "Ready";
@@ -330,7 +343,9 @@ Report run_benchmark(BenchConfig cfg) {
         char key_buf[16];
         snprintf(key_buf, sizeof(key_buf), "s_%d", i);
         // Move semantics: the freshly built doc is consumed, no deep clone.
-        hk_engine_insert_take(db, "bench", key_buf, d.release());
+        if (check(hk_engine_insert_take(db, "bench", key_buf, d.release()), "single-insert") != 0) {
+            res.success = false; return res;
+        }
     }
     res.single_wps = to_throughput(s_write_count, diff_ms(t_start));
     // cout << fixed << setprecision(0) << res.single_wps << " wps";
@@ -352,7 +367,9 @@ Report run_benchmark(BenchConfig cfg) {
             snprintf(key_buf, sizeof(key_buf), "b_%d", i + j);
             hk_batch_set(b.get(), "bench", key_buf, d.get());
         }
-        hk_batch_commit(db, b.get());
+        if (check(hk_batch_commit(db, b.get()), "batch-commit") != 0) {
+            res.success = false; return res;
+        }
     }
     res.batch_wps = to_throughput(b_total, diff_ms(t_start));
     // cout << res.batch_wps << " wps";
@@ -372,8 +389,24 @@ Report run_benchmark(BenchConfig cfg) {
     // ponytail: readiness is NOT quiescence — the async index worker may
     // still hold batch puts (fast boxes outrun it and then benchmark
     // empty postings: box-observed 543k phantom Qry at docs=300 vs 70k
-    // real on rerun). Settle everything before measuring reads.
+    // real on rerun). Settle everything before measuring reads — and
+    // FAIL LOUDLY on timeout (degraded numbers must never pass silent).
     hk_engine_await_quiescent(db, 60000);
+    {
+        // Sanity gate: Eq(age==38) must hit ~N/70 rows. Catches broken
+        // index states deterministically (box-observed: 5000-entry
+        // doc-id map under "age" instead of 70 int buckets).
+        int expect = (cfg.total_docs + 69) / 70;
+        UniqueQuery sq(hk_query_new("bench"));
+        hk_query_where_eq_int(sq.get(), "age", 38);
+        hk_query_limit(sq.get(), expect + 100);
+        UniqueResultSet srs(hk_query_execute_to_handles(db, sq.get()));
+        size_t got = hk_result_set_count(srs.get());
+        if (got < (size_t)(expect > 2 ? expect - 2 : 0) || got > (size_t)(expect + 100)) {
+            cout << "SETUP-FAIL sanity Eq(age==38): got " << got << " want ~" << expect << "\n";
+            res.success = false; return res;
+        }
+    }
     // cout << "Done";
 
     // Agg-only isolation: skip straight to the Agg lane (seed +
@@ -555,6 +588,13 @@ Report run_benchmark(BenchConfig cfg) {
     t_start = now(); 
     for(int i=0; i<50; i++) UniqueString agg_result(hk_query_execute_aggregation(db, aq.get())); 
     res.agg_qps = to_throughput(50, diff_ms(t_start));
+    // ponytail: permanent correctness tripwire — the value tells which
+    // path produced the timing (fast path sums correctly; a broken
+    // index sums 0.0 over garbage buckets at O(N) cost).
+    {
+        UniqueString v(hk_query_execute_aggregation(db, aq.get()));
+        cout << "[agg-value=" << (v ? v.get() : "null") << "]";
+    }
     // TEMP-DIAG (never merge): print the actual sum once (correctness
     // of whatever path produced the timing above).
     {
