@@ -378,8 +378,7 @@ Report run_benchmark(BenchConfig cfg) {
 
     // Agg-only isolation: skip straight to the Agg lane (seed +
     // quiescence already done above).
-    if (g_agg_only) goto agg_lane;
-
+    if (!g_agg_only) {
     // 2. READ TEST
     // stage("Point Read RPS (Seq)");
     t_start = now();
@@ -544,9 +543,10 @@ Report run_benchmark(BenchConfig cfg) {
     }
     res.json_big_qps = to_throughput(3000, diff_ms(t_start));
 
+    } // end skip-lanes (agg-only jumps straight to Agg below)
+
     // 6. AGGREGATION
     // stage("Aggregation QPS");
-agg_lane:;
     // ponytail: sum over the NUMERIC indexed field (fast path: per-bucket
     // val x count, O(70 buckets)). sum("id") measured parse-failures on
     // string keys (always 0.0) — same O(N) walk, zero meaning.
@@ -563,6 +563,7 @@ agg_lane:;
     }
     // cout << (int)res.agg_qps << " qps";
 
+    if (!g_agg_only) {
     // 6b. FULL-SCAN TRIO — mirrors sqlite_bench.cpp scan block 1:1.
     // Decoded fwd/rev: ORDER BY id + start_after pages of 1000 (executing
     // decodes every row; counting forces the work). Raw: one walk call
@@ -649,6 +650,8 @@ agg_lane:;
     hk_batch_commit(db, batch_del.get());
     res.bulk_del_wps = to_throughput(del_count, diff_ms(t_start));
     // cout << (int)res.bulk_del_wps << " wps";
+
+    } // end skip-lanes (agg-only rejoins here for shutdown)
 
     // 8. SHUTDOWN
     // stage("Shutdown (Flush)");
@@ -975,6 +978,7 @@ int main(int argc, char** argv) {
         if (a.find("--vk=") == 0) vk = stoi(a.substr(5));
         if (a.find("--vqueries=") == 0) vqueries = stoi(a.substr(11));
         if (a.find("--soak=") == 0) soak_s = stoi(a.substr(7));
+        if (a == "--aggonly") g_agg_only = true;
     }
     g_wstats_enabled = wstats;
     if (soak_s > 0) {
