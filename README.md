@@ -10,7 +10,7 @@ run locally against a core build or a release tag asset.
 
 | hakobench | hakodb core |
 |---|---|
-| 0.1.1 | `cloud_sync` branch / `v0.8.21`+ release asset |
+| 0.1.1 | `v0.8.21`+ through `v0.15.x` release asset or core build (`--docs=1000 --gate`) |
 
 ## Build (Windows, MinGW)
 
