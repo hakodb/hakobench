@@ -370,6 +370,9 @@ Report run_benchmark(BenchConfig cfg) {
     }
     hk_engine_create_index(db, "bench", "[{\"field\": \"id\", \"desc\": false}]");
     hk_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"score\", \"desc\": true}]");
+    // F6: full-key composite equality (tenant, active) — the shape the
+    // covering read requires, projected onto both indexed fields.
+    hk_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"active\", \"desc\": false}]");
     // F2: composite index over a dotted path (planner probes it directly).
     hk_engine_create_index(db, "bench", "[{\"field\": \"profile.city\", \"desc\": false}]");
     // F1: unique sparse index on its own collection. Envelope form is
@@ -679,24 +682,25 @@ Report run_benchmark(BenchConfig cfg) {
         }
         res.dotted_qps = to_throughput(stress_loops, diff_ms(t_start));
     }
-    // F6: identical filter/order; the first projection is fully covered by
-    // the (tenant, score) index (index-only read), the second adds a
-    // non-indexed field so the decode path runs. Same JSON emit on both.
+    // F6: identical full-key composite filters; the first projection is
+    // fully covered by the (tenant, active) index (index-only read), the
+    // second adds a non-indexed field so the decode path runs. Same JSON
+    // emit on both lanes.
     {
         auto proj_lane = [&](const char* const* fields, int n) {
             auto t = now();
             for (int i = 0; i < stress_loops; i++) {
                 UniqueQuery q(hk_query_new("bench"));
                 hk_query_where_eq_str(q.get(), "tenant", "tenant-2");
-                hk_query_order_by(q.get(), "score", false);
+                hk_query_where_eq_bool(q.get(), "active", 1);
                 for (int f = 0; f < n; f++) hk_query_select_field(q.get(), fields[f]);
                 hk_query_limit(q.get(), 20);
                 UniqueString js(hk_query_execute(db, q.get()));
             }
             return to_throughput(stress_loops, diff_ms(t));
         };
-        static const char* const proj_covered[] = {"tenant", "score"};
-        static const char* const proj_decoded[] = {"tenant", "score", "extra"};
+        static const char* const proj_covered[] = {"tenant", "active"};
+        static const char* const proj_decoded[] = {"tenant", "active", "extra"};
         res.cover_qps = proj_lane(proj_covered, 2);
         res.proj_qps = proj_lane(proj_decoded, 3);
     }
