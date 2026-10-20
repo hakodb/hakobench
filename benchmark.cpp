@@ -101,6 +101,19 @@ struct Report {
     double json_qps = 0;
     double json_big_qps = 0;
 
+    // EXTENDED (hakodb#71): F1 unique writes, F2 dotted queries,
+    // F6 index-only projection vs decode path.
+    bool has_dotted = false;
+    bool has_unique = false;
+    long dotted_rows = 0;
+    double dotted_qps = 0;
+    double cover_qps = 0;
+    double proj_qps = 0;
+    double uniq_wps = 0;
+    double uniq_reject_qps = 0;
+    long uniq_attempts = 0;
+    long uniq_rejects = 0;
+
     // FULL SCANS (docs/s over live docs x iters)
     double scan_fwd_dps = 0;
     double scan_rev_dps = 0;
@@ -181,6 +194,14 @@ static int check_gate(const Report& r) {
     // This still trips catastrophic batch breakage; real batch economics
     // (fsync amortization) live in the Always profiles, not this check.
     need(r.batch_wps >= 0.5 * r.single_wps, "Batch>=0.5Single", r.batch_wps, r.single_wps);
+    // hakodb#71 feature lanes: correctness only (no perf floor yet �?" the
+    // reference band lands with the first box run). A missing feature reads
+    // as a failure here, so a core that drops F1/F2 support trips the gate.
+    need(r.has_dotted && r.dotted_rows > 0, "F2 dotted path",
+         r.has_dotted ? (double)r.dotted_rows : 0, 1);
+    need(r.has_unique, "F1 unique index", r.has_unique ? 1 : 0, 1);
+    need(r.uniq_attempts > 0 && r.uniq_rejects == r.uniq_attempts,
+         "F1 rejects dup", (double)r.uniq_rejects, (double)r.uniq_attempts);
     return fails;
 }
 
@@ -265,6 +286,23 @@ UniqueDoc make_complex_doc(int i, const string& payload) {
     hk_array_append_str(tags, "bench");
     hk_doc_insert_array(d.get(), "tags", tags); 
     if (!payload.empty()) hk_doc_insert_str(d.get(), "extra", payload.c_str());
+    // F1: unique sparse index target (one value per doc, no collisions).
+    snprintf(buf, sizeof(buf), "slug-%d", i);
+    hk_doc_insert_str(d.get(), "slug", buf);
+    // F2: nested object queried through dotted paths.
+    {
+        UniqueDoc prof(hk_doc_new());
+        snprintf(buf, sizeof(buf), "city-%d", i % 8);
+        hk_doc_insert_str(prof.get(), "city", buf);
+        hk_doc_insert_int(prof.get(), "zip", 10000 + (i % 90));
+        hk_doc_insert_doc(d.get(), "profile", prof.get());
+    }
+    // Segmentation: every 8th doc carries a >4 KB body (default 1 KB
+    // path) so inline/segment boundaries get exercised across profiles.
+    if (i % 8 == 0) {
+        static const string seg_body = make_payload(5);
+        hk_doc_insert_str(d.get(), "body", seg_body.c_str());
+    }
     return d;
 }
 
@@ -332,6 +370,26 @@ Report run_benchmark(BenchConfig cfg) {
     }
     hk_engine_create_index(db, "bench", "[{\"field\": \"id\", \"desc\": false}]");
     hk_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"score\", \"desc\": true}]");
+    // F6: full-key composite equality (tenant, active) — the shape the
+    // covering read requires, projected onto both indexed fields.
+    hk_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"active\", \"desc\": false}]");
+    // F2: composite index over a dotted path (planner probes it directly).
+    hk_engine_create_index(db, "bench", "[{\"field\": \"profile.city\", \"desc\": false}]");
+    // F1: unique sparse index on its own collection. Envelope form is
+    // hakodb#71+; older cores parse it as a field spec and ignore it, so
+    // the duplicate probe below decides whether the lanes can run.
+    hk_engine_create_index(db, "uniqbench",
+        "[{\"fields\": [{\"field\": \"slug\", \"desc\": false}], \"unique\": true, \"sparse\": true}]");
+    {
+        UniqueDoc a(hk_doc_new()), b(hk_doc_new());
+        hk_doc_insert_str(a.get(), "slug", "uq-probe");
+        hk_doc_insert_str(b.get(), "slug", "uq-probe");
+        int rc_a = hk_engine_insert_take(db, "uniqbench", "uq_probe_a", a.release());
+        int rc_b = hk_engine_insert_take(db, "uniqbench", "uq_probe_b", b.release());
+        res.has_unique = rc_a == 0 && rc_b != 0;
+        hk_engine_delete(db, "uniqbench", "uq_probe_a");
+        hk_engine_delete(db, "uniqbench", "uq_probe_b");
+    }
     // cout << "Ready";
 
     // 1. WRITE TEST
@@ -406,6 +464,13 @@ Report run_benchmark(BenchConfig cfg) {
             cout << "SETUP-FAIL sanity Eq(age==38): got " << got << " want ~" << expect << "\n";
             res.success = false; return res;
         }
+        // F2 probe: dotted filter must reach the nested profile.city field.
+        // Old cores treat the path as a literal field and return 0 rows.
+        UniqueQuery dq(hk_query_new("bench"));
+        hk_query_where_eq_str(dq.get(), "profile.city", "city-3");
+        UniqueResultSet drs(hk_query_execute_to_handles(db, dq.get()));
+        res.dotted_rows = (long)hk_result_set_count(drs.get());
+        res.has_dotted = res.dotted_rows > 0;
     }
     // cout << "Done";
 
@@ -575,6 +640,70 @@ Report run_benchmark(BenchConfig cfg) {
         for(int i=0; i<3000; i++) UniqueString js(hk_doc_to_json(big.get()));
     }
     res.json_big_qps = to_throughput(3000, diff_ms(t_start));
+
+    // 5d. EXTENDED (hakodb#71) �? F1/F2/F6 lanes.
+    // Unique writes live on their own collection so newer cores don't get
+    // extra rows in the shared dataset's scan/agg numbers.
+    if (res.has_unique) {
+        const int UQ = 100;
+        t_start = now();
+        for (int i = 0; i < UQ; i++) {
+            UniqueDoc d(hk_doc_new());
+            char kb[16], sb[24];
+            snprintf(kb, sizeof(kb), "u_%d", i);
+            snprintf(sb, sizeof(sb), "u-slug-%d", i);
+            hk_doc_insert_str(d.get(), "slug", sb);
+            if (hk_engine_insert_take(db, "uniqbench", kb, d.release()) != 0) {
+                res.success = false; break;
+            }
+        }
+        res.uniq_wps = to_throughput(UQ, diff_ms(t_start));
+        // Every attempt reuses u-slug-0: all must be refused (no doc grow).
+        t_start = now();
+        for (int i = 0; i < UQ; i++) {
+            UniqueDoc d(hk_doc_new());
+            char kb[16];
+            snprintf(kb, sizeof(kb), "ud_%d", i);
+            hk_doc_insert_str(d.get(), "slug", "u-slug-0");
+            if (hk_engine_insert_take(db, "uniqbench", kb, d.release()) != 0) res.uniq_rejects++;
+            res.uniq_attempts++;
+        }
+        res.uniq_reject_qps = to_throughput(UQ, diff_ms(t_start));
+    }
+    // Dotted query: 1/8 of docs match, simple secondary on the dotted path
+    // so this rides the same P2 route as the flat Qry lane.
+    if (res.has_dotted) {
+        t_start = now();
+        for (int i = 0; i < stress_loops; i++) {
+            UniqueQuery q(hk_query_new("bench"));
+            hk_query_where_eq_str(q.get(), "profile.city", "city-3");
+            hk_query_limit(q.get(), 20);
+            UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
+        }
+        res.dotted_qps = to_throughput(stress_loops, diff_ms(t_start));
+    }
+    // F6: identical full-key composite filters; the first projection is
+    // fully covered by the (tenant, active) index (index-only read), the
+    // second adds a non-indexed field so the decode path runs. Same JSON
+    // emit on both lanes.
+    {
+        auto proj_lane = [&](const char* const* fields, int n) {
+            auto t = now();
+            for (int i = 0; i < stress_loops; i++) {
+                UniqueQuery q(hk_query_new("bench"));
+                hk_query_where_eq_str(q.get(), "tenant", "tenant-2");
+                hk_query_where_eq_bool(q.get(), "active", 1);
+                for (int f = 0; f < n; f++) hk_query_select_field(q.get(), fields[f]);
+                hk_query_limit(q.get(), 20);
+                UniqueString js(hk_query_execute(db, q.get()));
+            }
+            return to_throughput(stress_loops, diff_ms(t));
+        };
+        static const char* const proj_covered[] = {"tenant", "active"};
+        static const char* const proj_decoded[] = {"tenant", "active", "extra"};
+        res.cover_qps = proj_lane(proj_covered, 2);
+        res.proj_qps = proj_lane(proj_decoded, 3);
+    }
 
     } // end skip-lanes (agg-only jumps straight to Agg below)
 
@@ -1132,6 +1261,24 @@ int main(int argc, char** argv) {
         cout << left << setw(14) << r.cfg.name
              << " json " << setw(9) << (int)r.json_qps
              << " json_big " << setw(9) << (int)r.json_big_qps << "\n";
+    }
+    cout << "\n--- EXTENDED (hakodb#71: dotted F2 / covering F6 / unique F1) ---\n";
+    for (const auto& r : results) {
+        cout << left << setw(14) << r.cfg.name;
+        if (r.has_dotted)
+            cout << " dotted " << setw(9) << (int)r.dotted_qps
+                 << " (" << r.dotted_rows << " rows)";
+        else
+            cout << " dotted n/a";
+        cout << "  cover " << setw(9) << (int)r.cover_qps
+             << " proj " << setw(9) << (int)r.proj_qps;
+        if (r.has_unique)
+            cout << "  uniq " << setw(9) << (int)r.uniq_wps
+                 << " reject " << setw(9) << (int)r.uniq_reject_qps
+                 << " (" << r.uniq_rejects << "/" << r.uniq_attempts << ")";
+        else
+            cout << "  uniq n/a";
+        cout << "\n";
     }
     } // end non-gate table
 
