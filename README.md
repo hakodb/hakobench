@@ -72,7 +72,16 @@ For each profile it reports throughput (operations per second) and system metric
 | `Startup/Flush` | Engine open (ms) and clean shutdown (ms) |
 | `Size` | On-disk database size |
 
-It runs six profiles across durability and workload mixes: `Always`, `Interval`, `Manual`, `OnCommit`, `Enc_Comp` (encrypted + compressed), and `Gaming` (large documents, parallel workers).
+It runs six profiles across durability and workload mixes: `Always`, `Interval`, `Manual`, `OnCommit`, `Enc_Comp` (encrypted + compressed), and `Gaming` (large documents, parallel workers). A seventh, `Segment`, is a diagnostic profile (0 inline budget + 1 MB rotation threshold) that spills WAL-inlined docs into segments and reports the on-disk segment/WAL inventory plus a timed `compact()`.
+
+The `EXTENDED` section covers the hakodb#71 index families (`dotted` F2, `cover`/`proj` F6, `uniq` F1). Which families the suite creates is selectable with `--index-groups` (default `std,f2f6`):
+
+| Group | Indexes |
+|---|---|
+| `std` | simple/secondary (`active`, `tenant`, `id`, `age`) + plain composites (`[id]`, `[tenant,score]`) |
+| `f2f6` | F1 unique (`uniqbench.slug`), F2 dotted (`[profile.city]`), F6 covering (`[tenant,active]`) |
+| `vector` | vector index on `bench.emb` (32-dim), plus a kNN lane |
+| `graph` | edge index on a 200-node/200-edge graph, plus BFS and edge-write lanes |
 
 ## Run
 
@@ -88,6 +97,13 @@ It runs six profiles across durability and workload mixes: `Always`, `Interval`,
 
 # CI regression gate: Qry>=Cmp, Off/Cur within 2x, Get>5xQry, Batch>=Single + smoke floors
 ./benchmark --gate
+
+# index-family isolation (each line = one family; default std,f2f6)
+./benchmark --index-groups=std
+./benchmark --index-groups=all --profile=Manual
+
+# segmentation/compaction diagnostic (0 inline budget, 1 MB rotation)
+./benchmark --profile=Segment --docs=1000
 
 # if the shared library is not on the default loader path (Linux/macOS)
 LD_LIBRARY_PATH=<hakodb>/target/release ./benchmark --docs=1000
