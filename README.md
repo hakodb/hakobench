@@ -74,7 +74,7 @@ For each profile it reports throughput (operations per second) and system metric
 
 It runs six profiles across durability and workload mixes: `Always`, `Interval`, `Manual`, `OnCommit`, `Enc_Comp` (encrypted + compressed), and `Gaming` (large documents, parallel workers). A seventh, `Segment`, is a diagnostic profile (0 inline budget + 1 MB rotation threshold) that spills WAL-inlined docs into segments and reports the on-disk segment/WAL inventory plus a timed `compact()`.
 
-The `EXTENDED` section covers the hakodb#71 index families (`dotted` F2, `cover`/`proj` F6, `uniq` F1). Which families the suite creates is selectable with `--index-groups` (default `std,f2f6`):
+The `EXTENDED` section covers the hakodb#71 index families (`dotted` F2, `cover`/`proj` F6, `uniq` F1). Which families the suite creates is selectable with `--index-groups` (default `std`; add `f2f6` for the extended lanes):
 
 | Group | Indexes |
 |---|---|
@@ -98,8 +98,9 @@ The `EXTENDED` section covers the hakodb#71 index families (`dotted` F2, `cover`
 # CI regression gate: Qry>=Cmp, Off/Cur within 2x, Get>5xQry, Batch>=Single + smoke floors
 ./benchmark --gate
 
-# index-family isolation (each line = one family; default std,f2f6)
+# index-family isolation (default std; f2f6 adds the extended lanes)
 ./benchmark --index-groups=std
+./benchmark --index-groups=std,f2f6 --profile=Manual
 ./benchmark --index-groups=all --profile=Manual
 
 # segmentation/compaction diagnostic (0 inline budget, 1 MB rotation)

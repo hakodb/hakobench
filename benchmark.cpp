@@ -156,15 +156,15 @@ static bool g_agg_only = false;
 
 // Index families created and maintained by the suite. Restricting them
 // (--index-groups=std / f2f6 / vector / graph) attributes write-path cost
-// per family; the default stays std+f2f6 = the historical matrix.
+// per family; default is std so the base Qry/Cmp regression stays visible.
 enum IndexGroup : uint32_t {
     IG_STD    = 1u << 0,  // simple/secondary + plain composite ([id], [tenant,score])
     IG_F2F6   = 1u << 1,  // F1 unique, F2 dotted, F6 covering composite
     IG_VECTOR = 1u << 2,  // vector index on bench.emb
     IG_GRAPH  = 1u << 3,  // edge index: traverse tracking + _from/_to
 };
-static uint32_t g_index_groups = IG_STD | IG_F2F6;
-static string g_index_groups_label = "std,f2f6";
+static uint32_t g_index_groups = IG_STD;
+static string g_index_groups_label = "std";
 
 static bool parse_index_groups(const string& spec) {
     if (spec == "all")    { g_index_groups = IG_STD | IG_F2F6 | IG_VECTOR | IG_GRAPH; g_index_groups_label = spec; return true; }
