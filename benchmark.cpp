@@ -251,14 +251,17 @@ static int check_gate(const Report& r) {
     // This still trips catastrophic batch breakage; real batch economics
     // (fsync amortization) live in the Always profiles, not this check.
     need(r.batch_wps >= 0.5 * r.single_wps, "Batch>=0.5Single", r.batch_wps, r.single_wps);
-    // hakodb#71 feature lanes: correctness only (no perf floor yet �?" the
+    // hakodb#71 feature lanes: correctness only (no perf floor yet — the
     // reference band lands with the first box run). A missing feature reads
     // as a failure here, so a core that drops F1/F2 support trips the gate.
-    need(r.has_dotted && r.dotted_rows > 0, "F2 dotted path",
-         r.has_dotted ? (double)r.dotted_rows : 0, 1);
-    need(r.has_unique, "F1 unique index", r.has_unique ? 1 : 0, 1);
-    need(r.uniq_attempts > 0 && r.uniq_rejects == r.uniq_attempts,
-         "F1 rejects dup", (double)r.uniq_rejects, (double)r.uniq_attempts);
+    // Only gated when the family is enabled; default --gate is base std.
+    if (g_index_groups & IG_F2F6) {
+        need(r.has_dotted && r.dotted_rows > 0, "F2 dotted path",
+             r.has_dotted ? (double)r.dotted_rows : 0, 1);
+        need(r.has_unique, "F1 unique index", r.has_unique ? 1 : 0, 1);
+        need(r.uniq_attempts > 0 && r.uniq_rejects == r.uniq_attempts,
+             "F1 rejects dup", (double)r.uniq_rejects, (double)r.uniq_attempts);
+    }
     return fails;
 }
 
@@ -1375,9 +1378,9 @@ int main(int argc, char** argv) {
         cout << "jsonstr  " << vr.str_p50 << "  " << vr.str_p99 << "\n";
         return 0;
     }
-    // Gate mode: Manual profile only (fast, covers all gated shapes).
-    // Forced to the default index groups so F1/F2 lanes always exist.
-    if (gate) { only_profile = "Manual"; parse_index_groups("std,f2f6"); }
+    // Gate mode: Manual profile only. Defaults to the base std dataset; pass
+    // --index-groups=std,f2f6 to gate the F1/F2/F6 lanes too.
+    if (gate) { only_profile = "Manual"; }
 
     vector<BenchConfig> suite = {
         {"Always",      g_docs, 10,  0, 4, false, false, 4,  false},

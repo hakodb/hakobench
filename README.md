@@ -96,6 +96,7 @@ The `EXTENDED` section covers the hakodb#71 index families (`dotted` F2, `cover`
 ./benchmark --profile=Always --wstats
 
 # CI regression gate: Qry>=Cmp, Off/Cur within 2x, Get>5xQry, Batch>=Single + smoke floors
+# default gates base std; add --index-groups=std,f2f6 to gate F1/F2/F6 lanes
 ./benchmark --gate
 
 # index-family isolation (default std; f2f6 adds the extended lanes)
