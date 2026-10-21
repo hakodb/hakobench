@@ -104,6 +104,7 @@ The `EXTENDED` section covers the hakodb#71 index families (`dotted` F2, `cover`
 
 # segmentation/compaction diagnostic (0 inline budget, 1 MB rotation)
 ./benchmark --profile=Segment --docs=1000
+# Segment needs the 5s maintenance tick; --no-maintenance reports segments n/a
 
 # if the shared library is not on the default loader path (Linux/macOS)
 LD_LIBRARY_PATH=<hakodb>/target/release ./benchmark --docs=1000

@@ -367,11 +367,13 @@ UniqueDoc make_complex_doc(int i, const string& payload) {
     hk_array_append_str(tags, "bench");
     hk_doc_insert_array(d.get(), "tags", tags); 
     if (!payload.empty()) hk_doc_insert_str(d.get(), "extra", payload.c_str());
-    // F1: unique sparse index target (one value per doc, no collisions).
-    snprintf(buf, sizeof(buf), "slug-%d", i);
-    hk_doc_insert_str(d.get(), "slug", buf);
-    // F2: nested object queried through dotted paths.
-    {
+    // F1/F2 fields only exist when their index family is enabled; otherwise
+    // the std-only dataset keeps the legacy shape and comparable Qry/Cmp.
+    if ((g_index_groups & IG_F2F6) != 0) {
+        // F1: unique sparse index target (one value per doc, no collisions).
+        snprintf(buf, sizeof(buf), "slug-%d", i);
+        hk_doc_insert_str(d.get(), "slug", buf);
+        // F2: nested object queried through dotted paths.
         UniqueDoc prof(hk_doc_new());
         snprintf(buf, sizeof(buf), "city-%d", i % 8);
         hk_doc_insert_str(prof.get(), "city", buf);
@@ -1003,9 +1005,10 @@ Report run_benchmark(BenchConfig cfg) {
     // then inventory what actually hit disk. The Segment profile sets a 0
     // inline budget, so every maintenance tick checkpoints WAL-inlined
     // docs into segments; without it a 1k-doc run never spills.
-    if (cfg.compaction_mb > 0) {
+    if (cfg.compaction_mb > 0 && !cfg.no_maintenance) {
         // The maintenance loop ticks every 5s; a 1k-doc run finishes
         // sooner, so let one tick checkpoint before inspecting files.
+        // --no-maintenance disables that tick, so the inventory is n/a.
         this_thread::sleep_for(chrono::milliseconds(6000));
         hk_engine_await_quiescent(db, 60000);
         auto t = now();
@@ -1507,6 +1510,11 @@ int main(int argc, char** argv) {
     cout << "\n--- SEGMENTS (Segment profile: spill-always + 1MB rotation) ---\n";
     for (const auto& r : results) {
         if (r.cfg.compaction_mb == 0) continue;
+        if (r.cfg.no_maintenance) {
+            cout << left << setw(14) << r.cfg.name
+                 << " segments n/a (maintenance disabled)\n";
+            continue;
+        }
         cout << left << setw(14) << r.cfg.name
              << " segments " << r.segment_count
              << " (" << (r.segment_bytes / 1024) << " KB)"
