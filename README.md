@@ -8,9 +8,7 @@ run locally against a core build or a release tag asset.
 
 ## Compatibility
 
-| hakobench | hakodb core |
-|---|---|
-| 0.1.1 | `v0.8.21`+ through `v0.15.x` release asset or core build (`--docs=1000 --gate`) |
+Works against the corresponding core release; each release pairs with a matching `hakodb` tag (see the releases page for the exact pairing).
 
 ## Build (Windows, MinGW)
 
