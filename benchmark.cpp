@@ -1187,8 +1187,13 @@ static int run_vector_benchmark(int n_docs, int dim, int k, int n_queries, bool 
                 const uint8_t* bytes = hk_rawdoc_bytes(rd, &bl);
                 const char* id = hk_rawdoc_id(rd, &il);
                 for (size_t b = 0; b < min<size_t>(bl, 16); b++) sink += bytes[b];
-                // keys are v_<index> — parse for recall membership.
-                int idx = atoi(id + 2);
+                // keys are v_<index> — parse for recall membership. The id
+                // view is (ptr, len), NOT NUL-terminated: atoi(id+2) once
+                // ran into adjacent float bytes that look like digits and
+                // read past the id (recall read ~0.89 at 10k docs).
+                int idx = 0;
+                for (uintptr_t p = 2; p < il && id[p] >= '0' && id[p] <= '9'; p++)
+                    idx = idx * 10 + (id[p] - '0');
                 got_ids.push_back(idx);
                 sink += il;
             }
