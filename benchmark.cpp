@@ -124,6 +124,10 @@ struct Report {
     bool has_graph = false;
     double graph_wps = 0;
     double graph_qps = 0;
+    // #217 P0-C: walk-only bfs (per-hit doc fetch + JSON render skipped)
+    // and the n_0 inbound cardinality assert value.
+    double graph_cnt_qps = 0;
+    long graph_n0_rows = -1;
     long graph_hits = 0;
 
     // SEGMENT/COMPACTION profile (cfg.compaction_mb > 0).
@@ -213,6 +217,11 @@ static int check_gate(const Report& r) {
              << " (" << (int)a << " vs " << (int)b << ")\n";
         if (!ok) fails++;
     };
+    // #217 P0-C: cardinality assert — "speed from missing data" must
+    // never read as performance (#209). n_0 has 16 inbound refs in the
+    // graph fixture; a broken backfill/backlink map shows up as a
+    // smaller row count at the same (or better) qps.
+    need(!r.has_graph || r.graph_n0_rows == 16, "n0 rows=16", r.graph_n0_rows, 16);
     // Smoke floors.
     need(r.stress_query_qps > 500, "Qry smoke", r.stress_query_qps, 500);
     need(r.comp_query_qps > 500, "Cmp smoke", r.comp_query_qps, 500);
@@ -878,13 +887,37 @@ Report run_benchmark(BenchConfig cfg) {
 
         const int GQ = 200;
         long hits = 0;
+        double call_ms[200];
         t_start = now();
         for (int i = 0; i < GQ; i++) {
+            auto c0 = now();
             UniqueString js(hk_engine_find_paths(db, "nodes", "n_0", 1, nullptr, 4, 50));
+            call_ms[i] = diff_ms(c0);
             if (js && string(js.get()) != "[]") hits++;
         }
         res.graph_qps = to_throughput(GQ, diff_ms(t_start));
         res.graph_hits = hits;
+        // #217 P0-C walk/render split: identical walk with the per-hit
+        // doc fetch and JSON render skipped. full - walk = the
+        // output-side residual (16 hit fetches + JSON render per call).
+        t_start = now();
+        for (int i = 0; i < GQ; i++) {
+            if (hk_engine_find_paths_count(db, "nodes", "n_0", 1, nullptr, 4, 50) < 0) break;
+        }
+        res.graph_cnt_qps = to_throughput(GQ, diff_ms(t_start));
+        {
+            UniqueString js0(hk_engine_find_paths(db, "nodes", "n_0", 1, nullptr, 4, 50));
+            long rows0 = 0;
+            if (js0) for (const char* c = js0.get(); *c; c++) if (*c == '}') rows0++;
+            res.graph_n0_rows = rows0;
+            cout << "graph n_0 rows=" << rows0 << " json="
+                 << (js0 ? string(js0.get()).substr(0, 400) : string("null")) << "\n";
+        }
+        // per-call distribution (usort a copy; n=200)
+        double s[200]; for (int i = 0; i < GQ; i++) s[i] = call_ms[i];
+        sort(s, s + GQ);
+        cout << "graph per-call ms: p50=" << s[100] << " p99=" << s[198]
+             << " max=" << s[199] << " hits=" << hits << "\n";
     }
 
     } // end skip-lanes (agg-only jumps straight to Agg below)
@@ -1510,7 +1543,9 @@ int main(int argc, char** argv) {
         if (r.has_graph)
             cout << "  graph " << setw(9) << (int)r.graph_wps << " wps"
                  << " bfs " << setw(9) << (int)r.graph_qps << " qps ("
-                 << r.graph_hits << " hits)";
+                 << r.graph_hits << " hits)"
+                 << " walk " << setw(9) << (int)r.graph_cnt_qps
+                 << " n0rows=" << r.graph_n0_rows;
         else
             cout << "  graph n/a";
         cout << "\n";
