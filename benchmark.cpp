@@ -78,6 +78,9 @@ struct BenchConfig {
     // Group-commit window override in ms (Interval mode, --interval-ms).
     // 0 = engine default. Cluster use-case: per-instance cadences.
     uint64_t interval_ms = 0;
+    // Compaction threshold in MB (0 = engine default 8 MB). Lowered by the
+    // Segment profile so checkpointed segments actually rotate.
+    size_t compaction_mb = 0;
 };
 
 struct Report {
@@ -109,10 +112,30 @@ struct Report {
     double dotted_qps = 0;
     double cover_qps = 0;
     double proj_qps = 0;
+    double full_proj_qps = 0; // issue #234: full-query control, same filters/index as proj
     double uniq_wps = 0;
     double uniq_reject_qps = 0;
     long uniq_attempts = 0;
     long uniq_rejects = 0;
+
+    // INDEX GROUPS (--index-groups): per-family lanes, opt-in so the
+    // default matrix keeps its historical shape.
+    bool has_vector = false;
+    double vec_qps = 0;
+    bool has_graph = false;
+    double graph_wps = 0;
+    double graph_qps = 0;
+    // #217 P0-C: walk-only bfs (per-hit doc fetch + JSON render skipped)
+    // and the n_0 inbound cardinality assert value.
+    double graph_cnt_qps = 0;
+    long graph_n0_rows = -1;
+    long graph_hits = 0;
+
+    // SEGMENT/COMPACTION profile (cfg.compaction_mb > 0).
+    int segment_count = 0;
+    size_t segment_bytes = 0;
+    size_t wal_bytes = 0;
+    double compact_ms = 0;
 
     // FULL SCANS (docs/s over live docs x iters)
     double scan_fwd_dps = 0;
@@ -136,6 +159,45 @@ static bool g_wstats_enabled = false;
 // whether Agg cost comes from prior-lane state or the dataset itself.
 static bool g_agg_only = false;
 
+// Index families created and maintained by the suite. Restricting them
+// (--index-groups=std / f2f6 / vector / graph) attributes write-path cost
+// per family; default is std so the base Qry/Cmp regression stays visible.
+enum IndexGroup : uint32_t {
+    IG_STD    = 1u << 0,  // simple/secondary + plain composite ([id], [tenant,score])
+    IG_F2F6   = 1u << 1,  // F1 unique, F2 dotted, F6 covering composite
+    IG_VECTOR = 1u << 2,  // vector index on bench.emb
+    IG_GRAPH  = 1u << 3,  // edge index: traverse tracking + _from/_to
+};
+static uint32_t g_index_groups = IG_STD;
+static string g_index_groups_label = "std";
+
+static bool parse_index_groups(const string& spec) {
+    if (spec == "all")    { g_index_groups = IG_STD | IG_F2F6 | IG_VECTOR | IG_GRAPH; g_index_groups_label = spec; return true; }
+    if (spec == "none")   { g_index_groups = 0; g_index_groups_label = spec; return true; }
+    uint32_t mask = 0;
+    string label, tok;
+    auto flush = [&]() -> bool {
+        if (tok == "std")         mask |= IG_STD;
+        else if (tok == "f2f6")   mask |= IG_F2F6;
+        else if (tok == "vector") mask |= IG_VECTOR;
+        else if (tok == "graph")  mask |= IG_GRAPH;
+        else return false;
+        if (!label.empty()) label += ",";
+        label += tok;
+        tok.clear();
+        return true;
+    };
+    for (char c : spec) {
+        if (c == ',') { if (!flush()) return false; }
+        else tok += c;
+    }
+    if (!tok.empty() && !flush()) return false;
+    if (label.empty()) return false;
+    g_index_groups = mask;
+    g_index_groups_label = label;
+    return true;
+}
+
 // Print + reset the engine's write-phase counters (hk_debug_write_stats).
 static void dump_wstats(const char* tag) {
     if (!g_wstats_enabled) return;
@@ -156,6 +218,11 @@ static int check_gate(const Report& r) {
              << " (" << (int)a << " vs " << (int)b << ")\n";
         if (!ok) fails++;
     };
+    // #217 P0-C: cardinality assert — "speed from missing data" must
+    // never read as performance (#209). n_0 has 16 inbound refs in the
+    // graph fixture; a broken backfill/backlink map shows up as a
+    // smaller row count at the same (or better) qps.
+    need(!r.has_graph || r.graph_n0_rows == 16, "n0 rows=16", r.graph_n0_rows, 16);
     // Smoke floors.
     need(r.stress_query_qps > 500, "Qry smoke", r.stress_query_qps, 500);
     need(r.comp_query_qps > 500, "Cmp smoke", r.comp_query_qps, 500);
@@ -194,14 +261,17 @@ static int check_gate(const Report& r) {
     // This still trips catastrophic batch breakage; real batch economics
     // (fsync amortization) live in the Always profiles, not this check.
     need(r.batch_wps >= 0.5 * r.single_wps, "Batch>=0.5Single", r.batch_wps, r.single_wps);
-    // hakodb#71 feature lanes: correctness only (no perf floor yet �?" the
+    // hakodb#71 feature lanes: correctness only (no perf floor yet — the
     // reference band lands with the first box run). A missing feature reads
     // as a failure here, so a core that drops F1/F2 support trips the gate.
-    need(r.has_dotted && r.dotted_rows > 0, "F2 dotted path",
-         r.has_dotted ? (double)r.dotted_rows : 0, 1);
-    need(r.has_unique, "F1 unique index", r.has_unique ? 1 : 0, 1);
-    need(r.uniq_attempts > 0 && r.uniq_rejects == r.uniq_attempts,
-         "F1 rejects dup", (double)r.uniq_rejects, (double)r.uniq_attempts);
+    // Only gated when the family is enabled; default --gate is base std.
+    if (g_index_groups & IG_F2F6) {
+        need(r.has_dotted && r.dotted_rows > 0, "F2 dotted path",
+             r.has_dotted ? (double)r.dotted_rows : 0, 1);
+        need(r.has_unique, "F1 unique index", r.has_unique ? 1 : 0, 1);
+        need(r.uniq_attempts > 0 && r.uniq_rejects == r.uniq_attempts,
+             "F1 rejects dup", (double)r.uniq_rejects, (double)r.uniq_attempts);
+    }
     return fails;
 }
 
@@ -270,6 +340,30 @@ static uintmax_t get_dir_size(const string& path) {
     return total;
 }
 
+// Segment/WAL inventory for the Segment profile: segment files are named
+// `segment-l<level>-<id>.dat` inside each collection dir, WAL is
+// `wal.log`. Filesystem scan instead of a new FFI surface — the storage
+// layout is the thing being measured.
+static void scan_segment_files(const string& path, int& seg_count, size_t& seg_bytes, size_t& wal_bytes) {
+    seg_count = 0;
+    seg_bytes = 0;
+    wal_bytes = 0;
+    try {
+        if (!fs::exists(path)) return;
+        for (const auto& entry : fs::recursive_directory_iterator(path)) {
+            if (!fs::is_regular_file(entry.path())) continue;
+            string name = entry.path().filename().string();
+            if (name.rfind("segment-l", 0) == 0 && name.size() > 4 &&
+                name.compare(name.size() - 4, 4, ".dat") == 0) {
+                seg_count++;
+                seg_bytes += (size_t)fs::file_size(entry.path());
+            } else if (name == "wal.log") {
+                wal_bytes += (size_t)fs::file_size(entry.path());
+            }
+        }
+    } catch (...) {}
+}
+
 UniqueDoc make_complex_doc(int i, const string& payload) {
     UniqueDoc d(hk_doc_new());
     char buf[64];
@@ -286,22 +380,25 @@ UniqueDoc make_complex_doc(int i, const string& payload) {
     hk_array_append_str(tags, "bench");
     hk_doc_insert_array(d.get(), "tags", tags); 
     if (!payload.empty()) hk_doc_insert_str(d.get(), "extra", payload.c_str());
-    // F1: unique sparse index target (one value per doc, no collisions).
-    snprintf(buf, sizeof(buf), "slug-%d", i);
-    hk_doc_insert_str(d.get(), "slug", buf);
-    // F2: nested object queried through dotted paths.
-    {
+    // F1/F2 fields only exist when their index family is enabled; otherwise
+    // the std-only dataset keeps the legacy shape and comparable Qry/Cmp.
+    if ((g_index_groups & IG_F2F6) != 0) {
+        // F1: unique sparse index target (one value per doc, no collisions).
+        snprintf(buf, sizeof(buf), "slug-%d", i);
+        hk_doc_insert_str(d.get(), "slug", buf);
+        // F2: nested object queried through dotted paths.
         UniqueDoc prof(hk_doc_new());
         snprintf(buf, sizeof(buf), "city-%d", i % 8);
         hk_doc_insert_str(prof.get(), "city", buf);
         hk_doc_insert_int(prof.get(), "zip", 10000 + (i % 90));
         hk_doc_insert_doc(d.get(), "profile", prof.get());
     }
-    // Segmentation: every 8th doc carries a >4 KB body (default 1 KB
-    // path) so inline/segment boundaries get exercised across profiles.
-    if (i % 8 == 0) {
-        static const string seg_body = make_payload(5);
-        hk_doc_insert_str(d.get(), "body", seg_body.c_str());
+    // Vector group: 32-dim embedding as LE-f32 binary, maintained by the
+    // vector index (same encoding the standalone --vector mode uses).
+    if ((g_index_groups & IG_VECTOR) != 0) {
+        float emb[32];
+        for (int k = 0; k < 32; k++) emb[k] = (float)((i * 31 + k * 17) % 97) / 97.0f;
+        hk_doc_insert_bin(d.get(), "emb", reinterpret_cast<const uint8_t*>(emb), sizeof(emb));
     }
     return d;
 }
@@ -312,7 +409,8 @@ HK_Config* create_config_ptr(const BenchConfig& cfg) {
     hk_config_set_query_workers(fcfg, cfg.threads);
     hk_config_set_compression(fcfg, cfg.zip, 3);
     hk_config_set_audit_log(fcfg, false, "");
-    hk_config_set_storage_tuning(fcfg, 4096, 8 * 1024 * 1024, 256);
+    hk_config_set_storage_tuning(fcfg, 4096,
+        (cfg.compaction_mb ? cfg.compaction_mb : 8) * 1024 * 1024, 256);
     hk_config_set_memory_limits(fcfg, 256 * 1024 * 1024, cfg.inline_mb * 1024 * 1024);
     if (cfg.wal_reserve_bytes > 0) hk_config_set_wal_reserve_bytes(fcfg, cfg.wal_reserve_bytes);
     if (cfg.no_maintenance) hk_config_set_background_maintenance(fcfg, false);
@@ -359,6 +457,9 @@ Report run_benchmark(BenchConfig cfg) {
     // cout << "ACTIVE";
 
     // stage("Indexing..");
+    // Group std: the lanes every profile has always carried (simple
+    // secondary + plain composite). Skipped entirely with --index-groups.
+    if (g_index_groups & IG_STD) {
     if (check(hk_engine_create_simple_index(db, "bench", "active"), "create:active")
         | check(hk_engine_create_simple_index(db, "bench", "tenant"), "create:tenant")
         | check(hk_engine_create_simple_index(db, "bench", "id"), "create:id")
@@ -368,11 +469,19 @@ Report run_benchmark(BenchConfig cfg) {
         | check(hk_engine_create_simple_index(db, "bench", "age"), "create:age")) {
         res.success = false; return res;
     }
+    // ponytail: create_index returns the index id (0 = rejected), not a
+    // status — older cores may reject dotted/composite shapes, and the
+    // lanes below already report n/a in that case, so don't abort here.
     hk_engine_create_index(db, "bench", "[{\"field\": \"id\", \"desc\": false}]");
     hk_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"score\", \"desc\": true}]");
+    }
+    // Group f2f6: the hakodb#71 feature families.
+    if (g_index_groups & IG_F2F6) {
     // F6: full-key composite equality (tenant, active) — the shape the
     // covering read requires, projected onto both indexed fields.
     hk_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"active\", \"desc\": false}]");
+    // issue #234: full-key composite incl. extra so the proj lane is index-only.
+    hk_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"active\", \"desc\": false}, {\"field\": \"extra\", \"desc\": false}]");
     // F2: composite index over a dotted path (planner probes it directly).
     hk_engine_create_index(db, "bench", "[{\"field\": \"profile.city\", \"desc\": false}]");
     // F1: unique sparse index on its own collection. Envelope form is
@@ -389,6 +498,47 @@ Report run_benchmark(BenchConfig cfg) {
         res.has_unique = rc_a == 0 && rc_b != 0;
         hk_engine_delete(db, "uniqbench", "uq_probe_a");
         hk_engine_delete(db, "uniqbench", "uq_probe_b");
+    }
+    }
+    // Group vector: index exists before the write lanes so inserts pay
+    // maintenance, not just a backfill.
+    if (g_index_groups & IG_VECTOR) {
+        int rc = hk_engine_create_vector_index(db, "bench", "emb", 32, 0);
+        if (check(rc, "create:vector(emb)")) { res.success = false; return res; }
+        res.has_vector = true;
+    }
+    // Group graph: node/edge docs live on their own collections so the
+    // bench lanes keep their row counts. Seeded before the edge index so
+    // creation is a backfill; the lane below pays maintenance.
+    if (g_index_groups & IG_GRAPH) {
+        for (int i = 0; i < 200; i++) {
+            UniqueDoc d(hk_doc_new());
+            char label[32], key[16];
+            snprintf(label, sizeof(label), "node-%d", i);
+            snprintf(key, sizeof(key), "n_%d", i);
+            hk_doc_insert_str(d.get(), "label", label);
+            if (check(hk_engine_insert_take(db, "nodes", key, d.release()), "graph:node")) {
+                res.success = false; return res;
+            }
+        }
+        for (int i = 0; i < 200; i++) {
+            UniqueDoc e(hk_doc_new());
+            char from[16], to[16], key[16];
+            snprintf(from, sizeof(from), "n_%d", i);
+            snprintf(to, sizeof(to), "n_%d", (i + 1) % 200);
+            snprintf(key, sizeof(key), "e_%d", i);
+            hk_doc_insert_reference(e.get(), "_from", "nodes", from);
+            hk_doc_insert_reference(e.get(), "_to", "nodes", to);
+            if (check(hk_engine_insert_take(db, "edges", key, e.release()), "graph:edge")) {
+                res.success = false; return res;
+            }
+        }
+        // Edge index = traverse tracking + simple indexes on _from/_to.
+        if (check(hk_engine_create_edge_index(db, "edges"), "graph:edge_index")
+            | check(hk_engine_create_traverse_index(db, "nodes"), "graph:traverse(nodes)")) {
+            res.success = false; return res;
+        }
+        res.has_graph = true;
     }
     // cout << "Ready";
 
@@ -672,7 +822,7 @@ Report run_benchmark(BenchConfig cfg) {
     }
     // Dotted query: 1/8 of docs match, simple secondary on the dotted path
     // so this rides the same P2 route as the flat Qry lane.
-    if (res.has_dotted) {
+    if (res.has_dotted && (g_index_groups & IG_F2F6)) {
         t_start = now();
         for (int i = 0; i < stress_loops; i++) {
             UniqueQuery q(hk_query_new("bench"));
@@ -682,17 +832,24 @@ Report run_benchmark(BenchConfig cfg) {
         }
         res.dotted_qps = to_throughput(stress_loops, diff_ms(t_start));
     }
-    // F6: identical full-key composite filters; the first projection is
-    // fully covered by the (tenant, active) index (index-only read), the
-    // second adds a non-indexed field so the decode path runs. Same JSON
-    // emit on both lanes.
-    {
+    // F6: both projections are FULLY INDEXED by (tenant, active, extra)
+    // with equality filters on all three fields (EXPLAIN: covering=true).
+    // `proj` selects all three fields; `full` uses the identical index and
+    // filters with no select as the decoded full-document control. This is
+    // the baseline for comparing projected vs normal query throughput in
+    // future hakodb versions (issue #234).
+    if (g_index_groups & IG_F2F6) {
+        // issue #234 fair test: all projected fields are in the composite
+        // index and carry equality filters, so both proj lanes are
+        // index-only reads. The full lane uses the identical filters/index
+        // with no select as the control.
         auto proj_lane = [&](const char* const* fields, int n) {
             auto t = now();
             for (int i = 0; i < stress_loops; i++) {
                 UniqueQuery q(hk_query_new("bench"));
                 hk_query_where_eq_str(q.get(), "tenant", "tenant-2");
                 hk_query_where_eq_bool(q.get(), "active", 1);
+                hk_query_where_eq_str(q.get(), "extra", payload.c_str());
                 for (int f = 0; f < n; f++) hk_query_select_field(q.get(), fields[f]);
                 hk_query_limit(q.get(), 20);
                 UniqueString js(hk_query_execute(db, q.get()));
@@ -701,8 +858,97 @@ Report run_benchmark(BenchConfig cfg) {
         };
         static const char* const proj_covered[] = {"tenant", "active"};
         static const char* const proj_decoded[] = {"tenant", "active", "extra"};
+        {
+            UniqueQuery q(hk_query_new("bench"));
+            hk_query_where_eq_str(q.get(), "tenant", "tenant-2");
+            hk_query_where_eq_bool(q.get(), "active", 1);
+            hk_query_where_eq_str(q.get(), "extra", payload.c_str());
+            for (int f = 0; f < 3; f++) hk_query_select_field(q.get(), proj_decoded[f]);
+            hk_query_limit(q.get(), 20);
+            char* e = hk_query_explain(db, q.get());
+            cout << "\nEXPLAIN proj lane: " << e << "\n";
+            hk_string_free(e);
+        }
         res.cover_qps = proj_lane(proj_covered, 2);
         res.proj_qps = proj_lane(proj_decoded, 3);
+        auto full_t = now();
+        for (int i = 0; i < stress_loops; i++) {
+            UniqueQuery q(hk_query_new("bench"));
+            hk_query_where_eq_str(q.get(), "tenant", "tenant-2");
+            hk_query_where_eq_bool(q.get(), "active", 1);
+            hk_query_where_eq_str(q.get(), "extra", payload.c_str());
+            hk_query_limit(q.get(), 20);
+            UniqueString js(hk_query_execute(db, q.get()));
+        }
+        res.full_proj_qps = to_throughput(stress_loops, diff_ms(full_t));
+    }
+    // Vector group: kNN through the maintained index (same near-filter the
+    // standalone --vector mode uses; 32 dims, generic head).
+    if (res.has_vector) {
+        float qv[32];
+        for (int k = 0; k < 32; k++) qv[k] = (float)((k * 17) % 97) / 97.0f;
+        const int VQ = 200;
+        t_start = now();
+        for (int i = 0; i < VQ; i++) {
+            UniqueQuery q(hk_query_new("bench"));
+            hk_query_where_near(q.get(), "emb", qv, 32);
+            hk_query_limit(q.get(), 10);
+            UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
+        }
+        res.vec_qps = to_throughput(VQ, diff_ms(t_start));
+    }
+    // Graph group: new edges pay index maintenance on _from/_to, then BFS
+    // incoming into n_0 rides the traverse tracking registered at setup.
+    if (res.has_graph) {
+        const int EG = 200;
+        t_start = now();
+        UniqueBatch eb(hk_batch_new());
+        for (int i = 0; i < EG; i++) {
+            UniqueDoc e(hk_doc_new());
+            char from[16], to[16], key[16];
+            snprintf(from, sizeof(from), "n_%d", i % 200);
+            snprintf(to, sizeof(to), "n_%d", (i * 7 + 3) % 200);
+            snprintf(key, sizeof(key), "x_%d", i);
+            hk_doc_insert_reference(e.get(), "_from", "nodes", from);
+            hk_doc_insert_reference(e.get(), "_to", "nodes", to);
+            hk_batch_set(eb.get(), "edges", key, e.get());
+        }
+        hk_batch_commit(db, eb.get());
+        res.graph_wps = to_throughput(EG, diff_ms(t_start));
+
+        const int GQ = 200;
+        long hits = 0;
+        double call_ms[200];
+        t_start = now();
+        for (int i = 0; i < GQ; i++) {
+            auto c0 = now();
+            UniqueString js(hk_engine_find_paths(db, "nodes", "n_0", 1, nullptr, 4, 50));
+            call_ms[i] = diff_ms(c0);
+            if (js && string(js.get()) != "[]") hits++;
+        }
+        res.graph_qps = to_throughput(GQ, diff_ms(t_start));
+        res.graph_hits = hits;
+        // #217 P0-C walk/render split: identical walk with the per-hit
+        // doc fetch and JSON render skipped. full - walk = the
+        // output-side residual (16 hit fetches + JSON render per call).
+        t_start = now();
+        for (int i = 0; i < GQ; i++) {
+            if (hk_engine_find_paths_count(db, "nodes", "n_0", 1, nullptr, 4, 50) < 0) break;
+        }
+        res.graph_cnt_qps = to_throughput(GQ, diff_ms(t_start));
+        {
+            UniqueString js0(hk_engine_find_paths(db, "nodes", "n_0", 1, nullptr, 4, 50));
+            long rows0 = 0;
+            if (js0) for (const char* c = js0.get(); *c; c++) if (*c == '}') rows0++;
+            res.graph_n0_rows = rows0;
+            cout << "graph n_0 rows=" << rows0 << " json="
+                 << (js0 ? string(js0.get()).substr(0, 400) : string("null")) << "\n";
+        }
+        // per-call distribution (usort a copy; n=200)
+        double s[200]; for (int i = 0; i < GQ; i++) s[i] = call_ms[i];
+        sort(s, s + GQ);
+        cout << "graph per-call ms: p50=" << s[100] << " p99=" << s[198]
+             << " max=" << s[199] << " hits=" << hits << "\n";
     }
 
     } // end skip-lanes (agg-only jumps straight to Agg below)
@@ -821,6 +1067,22 @@ Report run_benchmark(BenchConfig cfg) {
     // cout << (int)res.bulk_del_wps << " wps";
 
     } // end skip-lanes (agg-only rejoins here for shutdown)
+
+    // SEGMENT/COMPACTION profile: settle, force a segment merge (timed),
+    // then inventory what actually hit disk. The Segment profile sets a 0
+    // inline budget, so every maintenance tick checkpoints WAL-inlined
+    // docs into segments; without it a 1k-doc run never spills.
+    if (cfg.compaction_mb > 0 && !cfg.no_maintenance) {
+        // The maintenance loop ticks every 5s; a 1k-doc run finishes
+        // sooner, so let one tick checkpoint before inspecting files.
+        // --no-maintenance disables that tick, so the inventory is n/a.
+        this_thread::sleep_for(chrono::milliseconds(6000));
+        hk_engine_await_quiescent(db, 60000);
+        auto t = now();
+        check(hk_engine_compact(db), "segment:compact");
+        res.compact_ms = diff_ms(t);
+        scan_segment_files(path, res.segment_count, res.segment_bytes, res.wal_bytes);
+    }
 
     // 8. SHUTDOWN
     // stage("Shutdown (Flush)");
@@ -989,8 +1251,13 @@ static int run_vector_benchmark(int n_docs, int dim, int k, int n_queries, bool 
                 const uint8_t* bytes = hk_rawdoc_bytes(rd, &bl);
                 const char* id = hk_rawdoc_id(rd, &il);
                 for (size_t b = 0; b < min<size_t>(bl, 16); b++) sink += bytes[b];
-                // keys are v_<index> — parse for recall membership.
-                int idx = atoi(id + 2);
+                // keys are v_<index> — parse for recall membership. The id
+                // view is (ptr, len), NOT NUL-terminated: atoi(id+2) once
+                // ran into adjacent float bytes that look like digits and
+                // read past the id (recall read ~0.89 at 10k docs).
+                int idx = 0;
+                for (uintptr_t p = 2; p < il && id[p] >= '0' && id[p] <= '9'; p++)
+                    idx = idx * 10 + (id[p] - '0');
                 got_ids.push_back(idx);
                 sink += il;
             }
@@ -1148,6 +1415,12 @@ int main(int argc, char** argv) {
         if (a.find("--vqueries=") == 0) vqueries = stoi(a.substr(11));
         if (a.find("--soak=") == 0) soak_s = stoi(a.substr(7));
         if (a == "--aggonly") g_agg_only = true;
+        if (a.find("--index-groups=") == 0) {
+            if (!parse_index_groups(a.substr(15))) {
+                cout << "bad --index-groups (std,f2f6,vector,graph | all | none)\n";
+                return 2;
+            }
+        }
     }
     g_wstats_enabled = wstats;
     if (soak_s > 0) {
@@ -1174,8 +1447,9 @@ int main(int argc, char** argv) {
         cout << "jsonstr  " << vr.str_p50 << "  " << vr.str_p99 << "\n";
         return 0;
     }
-    // Gate mode: Manual profile only (fast, covers all gated shapes).
-    if (gate) only_profile = "Manual";
+    // Gate mode: Manual profile only. Defaults to the base std dataset; pass
+    // --index-groups=std,f2f6 to gate the F1/F2/F6 lanes too.
+    if (gate) { only_profile = "Manual"; }
 
     vector<BenchConfig> suite = {
         {"Always",      g_docs, 10,  0, 4, false, false, 4,  false},
@@ -1183,8 +1457,14 @@ int main(int argc, char** argv) {
         {"Manual",      g_docs, 10,  2, 4, false, false, 4,  false},
         {"OnCommit",    g_docs, 10,  3, 8, true,  false, 8,  false},
         {"Enc_Comp",    g_docs, 10,  1, 8, true,  true,  8,  false},
-        {"Gaming",      g_docs, 10,  2, 8, false, false, 64, true}
+        {"Gaming",      g_docs, 10,  2, 8, false, false, 64, true},
+        // Diagnostic: 0 inline budget + 1 MB compaction threshold. The
+        // budget is per shard, so a 1 MB value never trips on a 1k-doc
+        // run spread over 4 shards; 0 makes every tick checkpoint into
+        // segments, and 1 MB threshold makes rotation fire.
+        {"Segment",     g_docs, 10,  2, 4, false, false, 0,  false}
     };
+    for (auto& cfg : suite) if (cfg.name == "Segment") cfg.compaction_mb = 1;
     for (auto& cfg : suite) cfg.wal_reserve_bytes = wal_reserve_mb * 1024ULL * 1024ULL;
     for (auto& cfg : suite) cfg.no_maintenance = no_maintenance;
     for (auto& cfg : suite) cfg.interval_ms = interval_ms;
@@ -1193,7 +1473,8 @@ int main(int argc, char** argv) {
     if (force_large_docs) for (auto& cfg : suite) cfg.large_docs = true;
 
     cout << "============================================================================================\n";
-    cout << " FIRE LITE PERFORMANCE MATRIX (v0.7.6) | THROUGHPUT MODE (Ops/Sec) | Total Docs: " << g_docs << "\n";
+    cout << " FIRE LITE PERFORMANCE MATRIX (v0.7.6) | THROUGHPUT MODE (Ops/Sec) | Total Docs: " << g_docs
+         << " | Index Groups: " << g_index_groups_label << "\n";
     cout << "============================================================================================\n";
 
     vector<Report> results;
@@ -1265,13 +1546,17 @@ int main(int argc, char** argv) {
     cout << "\n--- EXTENDED (hakodb#71: dotted F2 / covering F6 / unique F1) ---\n";
     for (const auto& r : results) {
         cout << left << setw(14) << r.cfg.name;
-        if (r.has_dotted)
+        if (r.has_dotted && (g_index_groups & IG_F2F6))
             cout << " dotted " << setw(9) << (int)r.dotted_qps
                  << " (" << r.dotted_rows << " rows)";
         else
             cout << " dotted n/a";
-        cout << "  cover " << setw(9) << (int)r.cover_qps
-             << " proj " << setw(9) << (int)r.proj_qps;
+        if (g_index_groups & IG_F2F6)
+            cout << "  cover " << setw(9) << (int)r.cover_qps
+                 << " proj " << setw(9) << (int)r.proj_qps
+                 << " full " << setw(9) << (int)r.full_proj_qps;
+        else
+            cout << "  cover n/a proj n/a";
         if (r.has_unique)
             cout << "  uniq " << setw(9) << (int)r.uniq_wps
                  << " reject " << setw(9) << (int)r.uniq_reject_qps
@@ -1279,6 +1564,37 @@ int main(int argc, char** argv) {
         else
             cout << "  uniq n/a";
         cout << "\n";
+    }
+    cout << "\n--- INDEX GROUPS (" << g_index_groups_label << ") ---\n";
+    for (const auto& r : results) {
+        cout << left << setw(14) << r.cfg.name;
+        if (r.has_vector)
+            cout << " vec " << setw(9) << (int)r.vec_qps << " qps";
+        else
+            cout << " vec n/a";
+        if (r.has_graph)
+            cout << "  graph " << setw(9) << (int)r.graph_wps << " wps"
+                 << " bfs " << setw(9) << (int)r.graph_qps << " qps ("
+                 << r.graph_hits << " hits)"
+                 << " walk " << setw(9) << (int)r.graph_cnt_qps
+                 << " n0rows=" << r.graph_n0_rows;
+        else
+            cout << "  graph n/a";
+        cout << "\n";
+    }
+    cout << "\n--- SEGMENTS (Segment profile: spill-always + 1MB rotation) ---\n";
+    for (const auto& r : results) {
+        if (r.cfg.compaction_mb == 0) continue;
+        if (r.cfg.no_maintenance) {
+            cout << left << setw(14) << r.cfg.name
+                 << " segments n/a (maintenance disabled)\n";
+            continue;
+        }
+        cout << left << setw(14) << r.cfg.name
+             << " segments " << r.segment_count
+             << " (" << (r.segment_bytes / 1024) << " KB)"
+             << " wal " << (r.wal_bytes / 1024) << " KB"
+             << " compact " << fixed << setprecision(1) << r.compact_ms << "ms\n";
     }
     } // end non-gate table
 
