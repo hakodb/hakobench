@@ -950,6 +950,74 @@ Report run_benchmark(BenchConfig cfg) {
         cout << "graph per-call ms: p50=" << s[100] << " p99=" << s[198]
              << " max=" << s[199] << " hits=" << hits << "\n";
     }
+    // Vector group: kNN through the maintained index (same near-filter the
+    // standalone --vector mode uses; 32 dims, generic head).
+    if (res.has_vector) {
+        float qv[32];
+        for (int k = 0; k < 32; k++) qv[k] = (float)((k * 17) % 97) / 97.0f;
+        const int VQ = 200;
+        t_start = now();
+        for (int i = 0; i < VQ; i++) {
+            UniqueQuery q(hk_query_new("bench"));
+            hk_query_where_near(q.get(), "emb", qv, 32);
+            hk_query_limit(q.get(), 10);
+            UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
+        }
+        res.vec_qps = to_throughput(VQ, diff_ms(t_start));
+    }
+    // Graph group: new edges pay index maintenance on _from/_to, then BFS
+    // incoming into n_0 rides the traverse tracking registered at setup.
+    if (res.has_graph) {
+        const int EG = 200;
+        t_start = now();
+        UniqueBatch eb(hk_batch_new());
+        for (int i = 0; i < EG; i++) {
+            UniqueDoc e(hk_doc_new());
+            char from[16], to[16], key[16];
+            snprintf(from, sizeof(from), "n_%d", i % 200);
+            snprintf(to, sizeof(to), "n_%d", (i * 7 + 3) % 200);
+            snprintf(key, sizeof(key), "x_%d", i);
+            hk_doc_insert_reference(e.get(), "_from", "nodes", from);
+            hk_doc_insert_reference(e.get(), "_to", "nodes", to);
+            hk_batch_set(eb.get(), "edges", key, e.get());
+        }
+        hk_batch_commit(db, eb.get());
+        res.graph_wps = to_throughput(EG, diff_ms(t_start));
+
+        const int GQ = 200;
+        long hits = 0;
+        double call_ms[200];
+        t_start = now();
+        for (int i = 0; i < GQ; i++) {
+            auto c0 = now();
+            UniqueString js(hk_engine_find_paths(db, "nodes", "n_0", 1, nullptr, 4, 50));
+            call_ms[i] = diff_ms(c0);
+            if (js && string(js.get()) != "[]") hits++;
+        }
+        res.graph_qps = to_throughput(GQ, diff_ms(t_start));
+        res.graph_hits = hits;
+        // #217 P0-C walk/render split: identical walk with the per-hit
+        // doc fetch and JSON render skipped. full - walk = the
+        // output-side residual (16 hit fetches + JSON render per call).
+        t_start = now();
+        for (int i = 0; i < GQ; i++) {
+            if (hk_engine_find_paths_count(db, "nodes", "n_0", 1, nullptr, 4, 50) < 0) break;
+        }
+        res.graph_cnt_qps = to_throughput(GQ, diff_ms(t_start));
+        {
+            UniqueString js0(hk_engine_find_paths(db, "nodes", "n_0", 1, nullptr, 4, 50));
+            long rows0 = 0;
+            if (js0) for (const char* c = js0.get(); *c; c++) if (*c == '}') rows0++;
+            res.graph_n0_rows = rows0;
+            cout << "graph n_0 rows=" << rows0 << " json="
+                 << (js0 ? string(js0.get()).substr(0, 400) : string("null")) << "\n";
+        }
+        // per-call distribution (usort a copy; n=200)
+        double s[200]; for (int i = 0; i < GQ; i++) s[i] = call_ms[i];
+        sort(s, s + GQ);
+        cout << "graph per-call ms: p50=" << s[100] << " p99=" << s[198]
+             << " max=" << s[199] << " hits=" << hits << "\n";
+    }
 
     } // end skip-lanes (agg-only jumps straight to Agg below)
 
