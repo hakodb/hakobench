@@ -112,6 +112,7 @@ struct Report {
     double dotted_qps = 0;
     double cover_qps = 0;
     double proj_qps = 0;
+    double full_proj_qps = 0; // issue #234: full-query control, same filters/index as proj
     double uniq_wps = 0;
     double uniq_reject_qps = 0;
     long uniq_attempts = 0;
@@ -479,6 +480,8 @@ Report run_benchmark(BenchConfig cfg) {
     // F6: full-key composite equality (tenant, active) — the shape the
     // covering read requires, projected onto both indexed fields.
     hk_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"active\", \"desc\": false}]");
+    // issue #234: full-key composite incl. extra so the proj lane is index-only.
+    hk_engine_create_index(db, "bench", "[{\"field\": \"tenant\", \"desc\": false}, {\"field\": \"active\", \"desc\": false}, {\"field\": \"extra\", \"desc\": false}]");
     // F2: composite index over a dotted path (planner probes it directly).
     hk_engine_create_index(db, "bench", "[{\"field\": \"profile.city\", \"desc\": false}]");
     // F1: unique sparse index on its own collection. Envelope form is
@@ -829,17 +832,24 @@ Report run_benchmark(BenchConfig cfg) {
         }
         res.dotted_qps = to_throughput(stress_loops, diff_ms(t_start));
     }
-    // F6: identical full-key composite filters; the first projection is
-    // fully covered by the (tenant, active) index (index-only read), the
-    // second adds a non-indexed field so the decode path runs. Same JSON
-    // emit on both lanes.
+    // F6: both projections are FULLY INDEXED by (tenant, active, extra)
+    // with equality filters on all three fields (EXPLAIN: covering=true).
+    // `proj` selects all three fields; `full` uses the identical index and
+    // filters with no select as the decoded full-document control. This is
+    // the baseline for comparing projected vs normal query throughput in
+    // future hakodb versions (issue #234).
     if (g_index_groups & IG_F2F6) {
+        // issue #234 fair test: all projected fields are in the composite
+        // index and carry equality filters, so both proj lanes are
+        // index-only reads. The full lane uses the identical filters/index
+        // with no select as the control.
         auto proj_lane = [&](const char* const* fields, int n) {
             auto t = now();
             for (int i = 0; i < stress_loops; i++) {
                 UniqueQuery q(hk_query_new("bench"));
                 hk_query_where_eq_str(q.get(), "tenant", "tenant-2");
                 hk_query_where_eq_bool(q.get(), "active", 1);
+                hk_query_where_eq_str(q.get(), "extra", payload.c_str());
                 for (int f = 0; f < n; f++) hk_query_select_field(q.get(), fields[f]);
                 hk_query_limit(q.get(), 20);
                 UniqueString js(hk_query_execute(db, q.get()));
@@ -848,8 +858,97 @@ Report run_benchmark(BenchConfig cfg) {
         };
         static const char* const proj_covered[] = {"tenant", "active"};
         static const char* const proj_decoded[] = {"tenant", "active", "extra"};
+        {
+            UniqueQuery q(hk_query_new("bench"));
+            hk_query_where_eq_str(q.get(), "tenant", "tenant-2");
+            hk_query_where_eq_bool(q.get(), "active", 1);
+            hk_query_where_eq_str(q.get(), "extra", payload.c_str());
+            for (int f = 0; f < 3; f++) hk_query_select_field(q.get(), proj_decoded[f]);
+            hk_query_limit(q.get(), 20);
+            char* e = hk_query_explain(db, q.get());
+            cout << "\nEXPLAIN proj lane: " << e << "\n";
+            hk_string_free(e);
+        }
         res.cover_qps = proj_lane(proj_covered, 2);
         res.proj_qps = proj_lane(proj_decoded, 3);
+        auto full_t = now();
+        for (int i = 0; i < stress_loops; i++) {
+            UniqueQuery q(hk_query_new("bench"));
+            hk_query_where_eq_str(q.get(), "tenant", "tenant-2");
+            hk_query_where_eq_bool(q.get(), "active", 1);
+            hk_query_where_eq_str(q.get(), "extra", payload.c_str());
+            hk_query_limit(q.get(), 20);
+            UniqueString js(hk_query_execute(db, q.get()));
+        }
+        res.full_proj_qps = to_throughput(stress_loops, diff_ms(full_t));
+    }
+    // Vector group: kNN through the maintained index (same near-filter the
+    // standalone --vector mode uses; 32 dims, generic head).
+    if (res.has_vector) {
+        float qv[32];
+        for (int k = 0; k < 32; k++) qv[k] = (float)((k * 17) % 97) / 97.0f;
+        const int VQ = 200;
+        t_start = now();
+        for (int i = 0; i < VQ; i++) {
+            UniqueQuery q(hk_query_new("bench"));
+            hk_query_where_near(q.get(), "emb", qv, 32);
+            hk_query_limit(q.get(), 10);
+            UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
+        }
+        res.vec_qps = to_throughput(VQ, diff_ms(t_start));
+    }
+    // Graph group: new edges pay index maintenance on _from/_to, then BFS
+    // incoming into n_0 rides the traverse tracking registered at setup.
+    if (res.has_graph) {
+        const int EG = 200;
+        t_start = now();
+        UniqueBatch eb(hk_batch_new());
+        for (int i = 0; i < EG; i++) {
+            UniqueDoc e(hk_doc_new());
+            char from[16], to[16], key[16];
+            snprintf(from, sizeof(from), "n_%d", i % 200);
+            snprintf(to, sizeof(to), "n_%d", (i * 7 + 3) % 200);
+            snprintf(key, sizeof(key), "x_%d", i);
+            hk_doc_insert_reference(e.get(), "_from", "nodes", from);
+            hk_doc_insert_reference(e.get(), "_to", "nodes", to);
+            hk_batch_set(eb.get(), "edges", key, e.get());
+        }
+        hk_batch_commit(db, eb.get());
+        res.graph_wps = to_throughput(EG, diff_ms(t_start));
+
+        const int GQ = 200;
+        long hits = 0;
+        double call_ms[200];
+        t_start = now();
+        for (int i = 0; i < GQ; i++) {
+            auto c0 = now();
+            UniqueString js(hk_engine_find_paths(db, "nodes", "n_0", 1, nullptr, 4, 50));
+            call_ms[i] = diff_ms(c0);
+            if (js && string(js.get()) != "[]") hits++;
+        }
+        res.graph_qps = to_throughput(GQ, diff_ms(t_start));
+        res.graph_hits = hits;
+        // #217 P0-C walk/render split: identical walk with the per-hit
+        // doc fetch and JSON render skipped. full - walk = the
+        // output-side residual (16 hit fetches + JSON render per call).
+        t_start = now();
+        for (int i = 0; i < GQ; i++) {
+            if (hk_engine_find_paths_count(db, "nodes", "n_0", 1, nullptr, 4, 50) < 0) break;
+        }
+        res.graph_cnt_qps = to_throughput(GQ, diff_ms(t_start));
+        {
+            UniqueString js0(hk_engine_find_paths(db, "nodes", "n_0", 1, nullptr, 4, 50));
+            long rows0 = 0;
+            if (js0) for (const char* c = js0.get(); *c; c++) if (*c == '}') rows0++;
+            res.graph_n0_rows = rows0;
+            cout << "graph n_0 rows=" << rows0 << " json="
+                 << (js0 ? string(js0.get()).substr(0, 400) : string("null")) << "\n";
+        }
+        // per-call distribution (usort a copy; n=200)
+        double s[200]; for (int i = 0; i < GQ; i++) s[i] = call_ms[i];
+        sort(s, s + GQ);
+        cout << "graph per-call ms: p50=" << s[100] << " p99=" << s[198]
+             << " max=" << s[199] << " hits=" << hits << "\n";
     }
     // Vector group: kNN through the maintained index (same near-filter the
     // standalone --vector mode uses; 32 dims, generic head).
@@ -1522,7 +1621,8 @@ int main(int argc, char** argv) {
             cout << " dotted n/a";
         if (g_index_groups & IG_F2F6)
             cout << "  cover " << setw(9) << (int)r.cover_qps
-                 << " proj " << setw(9) << (int)r.proj_qps;
+                 << " proj " << setw(9) << (int)r.proj_qps
+                 << " full " << setw(9) << (int)r.full_proj_qps;
         else
             cout << "  cover n/a proj n/a";
         if (r.has_unique)

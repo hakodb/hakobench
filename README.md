@@ -8,7 +8,9 @@ run locally against a core build or a release tag asset.
 
 ## Compatibility
 
-Works against the corresponding core release; each release pairs with a matching `hakodb` tag (see the releases page for the exact pairing).
+| hakobench | hakodb core |
+|---|---|
+| 0.1.1 | `v0.8.21`+ through `v0.15.x` release asset or core build (`--docs=1000 --gate`) |
 
 ## Build (Windows, MinGW)
 
@@ -72,7 +74,7 @@ For each profile it reports throughput (operations per second) and system metric
 
 It runs six profiles across durability and workload mixes: `Always`, `Interval`, `Manual`, `OnCommit`, `Enc_Comp` (encrypted + compressed), and `Gaming` (large documents, parallel workers). A seventh, `Segment`, is a diagnostic profile (0 inline budget + 1 MB rotation threshold) that spills WAL-inlined docs into segments and reports the on-disk segment/WAL inventory plus a timed `compact()`.
 
-The `EXTENDED` section covers the hakodb#71 index families (`dotted` F2, `cover`/`proj` F6, `uniq` F1). Which families the suite creates is selectable with `--index-groups` (default `std`; add `f2f6` for the extended lanes):
+The `EXTENDED` section covers the hakodb#71 index families (`dotted` F2, `cover`/`proj` F6, `uniq` F1). Which families the suite creates is selectable with `--index-groups` (default `std`):
 
 | Group | Indexes |
 |---|---|
@@ -94,17 +96,14 @@ The `EXTENDED` section covers the hakodb#71 index families (`dotted` F2, `cover`
 ./benchmark --profile=Always --wstats
 
 # CI regression gate: Qry>=Cmp, Off/Cur within 2x, Get>5xQry, Batch>=Single + smoke floors
-# default gates base std; add --index-groups=std,f2f6 to gate F1/F2/F6 lanes
 ./benchmark --gate
 
-# index-family isolation (default std; f2f6 adds the extended lanes)
+# index-family isolation (each line = one family; default std)
 ./benchmark --index-groups=std
-./benchmark --index-groups=std,f2f6 --profile=Manual
 ./benchmark --index-groups=all --profile=Manual
 
 # segmentation/compaction diagnostic (0 inline budget, 1 MB rotation)
 ./benchmark --profile=Segment --docs=1000
-# Segment needs the 5s maintenance tick; --no-maintenance reports segments n/a
 
 # if the shared library is not on the default loader path (Linux/macOS)
 LD_LIBRARY_PATH=<hakodb>/target/release ./benchmark --docs=1000
