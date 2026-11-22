@@ -47,6 +47,9 @@ using UniqueString = unique_ptr<char, HKDeleter>;
 using UniqueConfig = unique_ptr<HK_Config, HKDeleter>;
 using UniqueWatch = unique_ptr<HK_Watch, HKDeleter>;
 using UniqueTx = unique_ptr<HK_Transaction, HKDeleter>;
+// #250: hk_query_reset available in core >= 0.21.8; declare here so this
+// harness also compiles against older release headers.
+extern "C" int hk_query_reset(HK_Query* query, const char* collection);
 using UniqueArray = unique_ptr<HK_Array, HKDeleter>;
 using UniqueResultSet = unique_ptr<HK_ResultSet, HKDeleter>;
 using UniqueRawResultSet = unique_ptr<HK_RawResultSet, HKDeleter>;
@@ -100,6 +103,7 @@ struct Report {
     double agg_qps = 0;
     double stress_get_rps = 0;     
     double stress_query_qps = 0; 
+    double stress_query_reuse_qps = 0; // #250: pooled HK_Query handle
     double comp_query_qps = 0; 
     double json_qps = 0;
     double json_big_qps = 0;
@@ -740,6 +744,19 @@ Report run_benchmark(BenchConfig cfg) {
     }
     res.stress_query_qps = to_throughput(stress_loops, diff_ms(t_start));
     // cout << (int)res.stress_query_qps << " qps";
+    // #250: same shape, ONE query handle reset per iteration — isolates
+    // queryNew/queryFree cost from the engine query cost.
+    {
+        UniqueQuery pooled(hk_query_new("bench"));
+        t_start = now();
+        for(int i=0; i<stress_loops; i++) {
+            hk_query_reset(pooled.get(), "bench");
+            hk_query_where_eq_str(pooled.get(), "tenant", "tenant-2");
+            hk_query_limit(pooled.get(), 20);
+            UniqueResultSet rs(hk_query_execute_to_handles(db, pooled.get()));
+        }
+        res.stress_query_reuse_qps = to_throughput(stress_loops, diff_ms(t_start));
+    }
 
     // stage("Composite Query QPS");
     t_start = now();
@@ -1563,7 +1580,7 @@ int main(int argc, char** argv) {
     cout << left << setw(14) << "Profile" << " | "
          << setw(14) << "WPS (Sgl/Btc)" << " | "
          << setw(16) << "RPS (Seq/Par)" << " | "
-         << setw(22) << "STRESS (Get/Qry/Cmp)" << " | "
+         << setw(28) << "STRESS (Get/Qry/Cmp/Reuse)" << " | "
          << setw(14) << "QPS (Off/Cur)" << " | "
          << setw(8)  << "Agg QPS" << " | "
          << setw(8)  << "Tx WPS" << " | "
@@ -1577,7 +1594,7 @@ int main(int argc, char** argv) {
         
         snprintf(buf_wps, sizeof(buf_wps), "%d / %d", (int)r.single_wps, (int)r.batch_wps);
         snprintf(buf_rps, sizeof(buf_rps), "%d / %d", (int)r.s_read_rps, (int)r.p_read_rps);
-        snprintf(buf_stress, sizeof(buf_stress), "%d/%d/%d", (int)r.stress_get_rps, (int)r.stress_query_qps, (int)r.comp_query_qps);
+        snprintf(buf_stress, sizeof(buf_stress), "%d/%d/%d/%d", (int)r.stress_get_rps, (int)r.stress_query_qps, (int)r.comp_query_qps, (int)r.stress_query_reuse_qps);
         snprintf(buf_qps, sizeof(buf_qps), "%d / %d", (int)r.offset_qps, (int)r.cursor_qps);
         snprintf(buf_bulk, sizeof(buf_bulk), "%d / %d", (int)r.bulk_upd_wps, (int)r.bulk_del_wps);
         snprintf(buf_sys, sizeof(buf_sys), "%dms/%dms", (int)r.startup_ms, (int)r.shutdown_ms);
