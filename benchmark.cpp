@@ -895,7 +895,7 @@ Report run_benchmark(BenchConfig cfg) {
                 hk_query_where_eq_str(q.get(), "extra", payload.c_str());
                 for (int f = 0; f < n; f++) hk_query_select_field(q.get(), fields[f]);
                 hk_query_limit(q.get(), 20);
-                UniqueString js(hk_query_execute(db, q.get()));
+                UniqueString js(hk_query_execute_ex(db, q.get(), nullptr));
             }
             return to_throughput(stress_loops, diff_ms(t));
         };
@@ -921,7 +921,7 @@ Report run_benchmark(BenchConfig cfg) {
             hk_query_where_eq_bool(q.get(), "active", 1);
             hk_query_where_eq_str(q.get(), "extra", payload.c_str());
             hk_query_limit(q.get(), 20);
-            UniqueString js(hk_query_execute(db, q.get()));
+            UniqueString js(hk_query_execute_ex(db, q.get(), nullptr));
         }
         res.full_proj_qps = to_throughput(stress_loops, diff_ms(full_t));
     }
@@ -1406,7 +1406,7 @@ static int run_vector_benchmark(int n_docs, int dim, int k, int n_queries, bool 
             hk_query_where_near(q.get(), "emb", qv.data(), dim);
             hk_query_limit(q.get(), k);
             auto t = now();
-            UniqueString js(hk_query_execute(db, q.get()));
+            UniqueString js(hk_query_execute_ex(db, q.get(), nullptr));
             if (js) sink += strlen(js.get());
             l_str.push_back(diff_ms(t));
         }
