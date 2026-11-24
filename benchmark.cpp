@@ -105,6 +105,8 @@ struct Report {
     double stress_query_qps = 0; 
     double stress_query_reuse_qps = 0; // #250: pooled HK_Query handle
     double comp_query_qps = 0; 
+    double composite_prefix_qps = 0; // #253: eq prefix + ORDER BY
+    double range_bound_qps = 0; // #253: range filter pushed into index bounds
     double json_qps = 0;
     double json_big_qps = 0;
 
@@ -769,6 +771,30 @@ Report run_benchmark(BenchConfig cfg) {
     }
     res.comp_query_qps = to_throughput(stress_loops, diff_ms(t_start));
     // cout << (int)res.comp_query_qps << " qps";
+
+    // #253 follow-up: tenant eq + score range + ORDER BY score.
+    t_start = now();
+    for(int i=0; i<stress_loops; i++) {
+        UniqueQuery q(hk_query_new("bench"));
+        hk_query_where_eq_str(q.get(), "tenant", "tenant-2");
+        hk_query_where_gte_int(q.get(), "score", 100);
+        hk_query_order_by(q.get(), "score", false);
+        hk_query_limit(q.get(), 20);
+        UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
+    }
+    res.composite_prefix_qps = to_throughput(stress_loops, diff_ms(t_start));
+
+    // #253 follow-up: score range + ORDER BY score (filter bounds -> index).
+    t_start = now();
+    for(int i=0; i<stress_loops; i++) {
+        UniqueQuery q(hk_query_new("bench"));
+        hk_query_where_gte_int(q.get(), "score", 100);
+        hk_query_where_lte_int(q.get(), "score", 200);
+        hk_query_order_by(q.get(), "score", false);
+        hk_query_limit(q.get(), 20);
+        UniqueResultSet rs(hk_query_execute_to_handles(db, q.get()));
+    }
+    res.range_bound_qps = to_throughput(stress_loops, diff_ms(t_start));
 
     // 5b. JSON RENDER QPS — same shape as Qry above (tenant-2, limit 20)
     // but every row goes through hk_doc_to_json (HakoDoc::write_json
@@ -1580,21 +1606,21 @@ int main(int argc, char** argv) {
     cout << left << setw(14) << "Profile" << " | "
          << setw(14) << "WPS (Sgl/Btc)" << " | "
          << setw(16) << "RPS (Seq/Par)" << " | "
-         << setw(28) << "STRESS (Get/Qry/Cmp/Reuse)" << " | "
+         << setw(36) << "STRESS (Get/Qry/Cmp/Reuse/Comp/Range)" << " | "
          << setw(14) << "QPS (Off/Cur)" << " | "
          << setw(8)  << "Agg QPS" << " | "
          << setw(8)  << "Tx WPS" << " | "
          << setw(16) << "Bulk Upd/Del" << " | "
          << setw(16) << "Startup/Flush" << " | "
          << "Size\n";
-    cout << string(170, '-') << "\n";
+    cout << string(180, '-') << "\n";
 
     for (const auto& r : results) {
         char buf_wps[32], buf_rps[32], buf_stress[48], buf_qps[32], buf_bulk[32], buf_sys[32];
         
         snprintf(buf_wps, sizeof(buf_wps), "%d / %d", (int)r.single_wps, (int)r.batch_wps);
         snprintf(buf_rps, sizeof(buf_rps), "%d / %d", (int)r.s_read_rps, (int)r.p_read_rps);
-        snprintf(buf_stress, sizeof(buf_stress), "%d/%d/%d/%d", (int)r.stress_get_rps, (int)r.stress_query_qps, (int)r.comp_query_qps, (int)r.stress_query_reuse_qps);
+        snprintf(buf_stress, sizeof(buf_stress), "%d/%d/%d/%d/%d/%d", (int)r.stress_get_rps, (int)r.stress_query_qps, (int)r.comp_query_qps, (int)r.stress_query_reuse_qps, (int)r.composite_prefix_qps, (int)r.range_bound_qps);
         snprintf(buf_qps, sizeof(buf_qps), "%d / %d", (int)r.offset_qps, (int)r.cursor_qps);
         snprintf(buf_bulk, sizeof(buf_bulk), "%d / %d", (int)r.bulk_upd_wps, (int)r.bulk_del_wps);
         snprintf(buf_sys, sizeof(buf_sys), "%dms/%dms", (int)r.startup_ms, (int)r.shutdown_ms);
@@ -1602,7 +1628,7 @@ int main(int argc, char** argv) {
         cout << left << setw(14) << r.cfg.name << " | "
              << left << setw(14) << buf_wps << " | "
              << left << setw(16) << buf_rps << " | "
-             << left << setw(22) << buf_stress << " | "
+             << left << setw(30) << buf_stress << " | "
              << left << setw(14) << buf_qps << " | "
              << left << setw(8)  << (int)r.agg_qps << " | "
              << left << setw(8)  << (int)r.tx_wps << " | "
